@@ -1,0 +1,42 @@
+Metadata-Version: 2.4
+Name: dnd-vtt
+Version: 0.1.0
+Summary: Open-source modular 2D DND virtual tabletop MVP
+Author: DND VTT Contributors
+License: MIT
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: pydantic>=2.6
+Requires-Dist: fastapi>=0.115
+Requires-Dist: uvicorn>=0.34
+Provides-Extra: dev
+Requires-Dist: pytest>=8.2; extra == "dev"
+Requires-Dist: pytest-cov>=5.0; extra == "dev"
+Requires-Dist: ruff>=0.8; extra == "dev"
+Requires-Dist: httpx>=0.27; extra == "dev"
+Dynamic: license-file
+Dynamic: requires-python
+
+# DND VTT
+
+Open-source, modular, Python-first virtual tabletop MVP focused on accessible online play.
+
+## MVP features
+- 2D top-down map and token state
+- Initiative, HP, conditions, and held item tracking
+- Character import normalization
+- ORC/OGL-friendly content pack loading
+- Signaling service and P2P-ready sync events
+- Starter tutorial map for DMs
+
+## Development
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e .[dev]
+pytest
+```
+
+## Architecture
+See `docs/architecture.md` and `docs/roadmap.md`.

@@ -1,0 +1,12 @@
+{
+  "tokens": [
+    {
+      "id": "hero_token",
+      "label": "Hero"
+    },
+    {
+      "id": "goblin_token",
+      "label": "Goblin"
+    }
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "map_id": "starter_encounter",
+  "name": "Roadside Ambush",
+  "width": 30,
+  "height": 20,
+  "spawn_points": [
+    {
+      "id": "party_start",
+      "x": 2,
+      "y": 10
+    }
+  ],
+  "notes": "Simple encounter map for first combat"
+}

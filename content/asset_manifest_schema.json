@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DND VTT Pack Manifest",
+  "type": "object",
+  "required": [
+    "pack_name",
+    "license_id",
+    "attribution",
+    "source_url",
+    "content_type"
+  ],
+  "properties": {
+    "pack_name": {
+      "type": "string"
+    },
+    "license_id": {
+      "type": "string"
+    },
+    "attribution": {
+      "type": "string"
+    },
+    "source_url": {
+      "type": "string"
+    },
+    "content_type": {
+      "type": "string",
+      "enum": [
+        "enemy",
+        "map",
+        "token",
+        "tutorial"
+      ]
+    }
+  }
+}

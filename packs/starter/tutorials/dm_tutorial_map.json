@@ -1,0 +1,11 @@
+{
+  "tutorial_id": "dm_quickstart",
+  "title": "DM Quickstart Encounter",
+  "estimated_minutes": 15,
+  "steps": [
+    "Create a new session and invite players.",
+    "Place tokens and set initiative order.",
+    "Apply one condition and one inventory item update.",
+    "Advance rounds and conclude encounter."
+  ]
+}

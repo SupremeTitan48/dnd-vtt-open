@@ -1,0 +1,11 @@
+{
+  "name": "Goblin Scout",
+  "armor_class": 15,
+  "hit_points": 7,
+  "speed": 30,
+  "actions": [
+    "Scimitar",
+    "Shortbow"
+  ],
+  "source": "ORC-compatible community content"
+}
