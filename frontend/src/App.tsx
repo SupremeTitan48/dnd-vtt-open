@@ -2,18 +2,30 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { ActorPanel } from "./components/ActorPanel";
 import { CharacterImportPanel } from "./components/CharacterImportPanel";
 import { DMToolsPanel } from "./components/DMToolsPanel";
+import { HandoutPanel } from "./components/HandoutPanel";
 import { InitiativePanel } from "./components/InitiativePanel";
+import { JournalPanel } from "./components/JournalPanel";
 import { MapCanvas } from "./components/MapCanvas";
 import { MapToolsPanel, type MapTool } from "./components/MapToolsPanel";
+import { MacroPanel } from "./components/MacroPanel";
 import { PermissionsPanel } from "./components/PermissionsPanel";
+import { PluginPanel } from "./components/PluginPanel";
+import { RollTemplatePanel } from "./components/RollTemplatePanel";
 import { SessionLobbyPanel } from "./components/SessionLobbyPanel";
 import { TutorialPanel } from "./components/TutorialPanel";
 import {
   addEncounterTemplate,
+  addAssetLibraryItem,
   assignActorOwnership,
   assignSessionRole,
+  createHandout,
+  createJournalEntry,
+  createMacro,
+  createRollTemplate,
   type CommandContext,
   createSession,
+  createSessionInCampaign,
+  executePluginHook,
   getSession,
   getEncounterTemplates,
   getSessionNotes,
@@ -21,22 +33,36 @@ import {
   getTutorial,
   importCharacter,
   joinSession,
+  listAssets,
   listCharacters,
+  listHandouts,
+  listJournalEntries,
+  listMacros,
+  listPlugins,
+  listRollTemplates,
   loadSession,
   moveToken,
   nextTurn,
   paintTerrain,
   revealCell,
   saveSession,
+  registerPlugin,
+  renderRollTemplate,
+  runMacro,
   setFog,
   setInitiative,
   setSessionNotes,
+  setTokenVisionRadius,
+  shareHandout,
+  shareJournalEntry,
   stampAsset,
   toggleBlocked,
+  updateHandout,
+  updateJournalEntry,
   updateActor,
 } from "./lib/apiClient";
 import { connectSessionEvents } from "./realtime/sessionRealtime";
-import type { CharacterSheet, EncounterTemplate, Session, Snapshot, Tutorial } from "./types";
+import type { AssetLibraryItem, CharacterSheet, EncounterTemplate, Handout, JournalEntry, Macro, Plugin, RollTemplate, Session, Snapshot, Tutorial } from "./types";
 
 const EMPTY_STATE: Snapshot = {
   map: {
@@ -48,6 +74,8 @@ const EMPTY_STATE: Snapshot = {
     terrain_tiles: {},
     blocked_cells: [],
     asset_stamps: {},
+    visibility_cells_by_token: {},
+    vision_radius_by_token: {},
   },
   combat: { initiative_order: [], turn_index: 0, round_number: 1 },
   actors: {},
@@ -62,11 +90,23 @@ export default function App() {
   const [characters, setCharacters] = useState<CharacterSheet[]>([]);
   const [notes, setNotes] = useState("");
   const [templates, setTemplates] = useState<EncounterTemplate[]>([]);
+  const [journalEntries, setJournalEntries] = useState<JournalEntry[]>([]);
+  const [handouts, setHandouts] = useState<Handout[]>([]);
+  const [assetLibrary, setAssetLibrary] = useState<AssetLibraryItem[]>([]);
+  const [macros, setMacros] = useState<Macro[]>([]);
+  const [rollTemplates, setRollTemplates] = useState<RollTemplate[]>([]);
+  const [plugins, setPlugins] = useState<Plugin[]>([]);
   const [selectedTokens, setSelectedTokens] = useState<string[]>(["hero"]);
   const [contextMenu, setContextMenu] = useState<ContextMenuState>(null);
+  const [rulerPreset, setRulerPreset] = useState<{ start: { x: number; y: number }; end: { x: number; y: number }; nonce: number } | null>(
+    null,
+  );
   const [activeTool, setActiveTool] = useState<MapTool>("move");
   const [terrainType, setTerrainType] = useState("grass");
   const [assetId, setAssetId] = useState("tree");
+  const [movementBudgetCells, setMovementBudgetCells] = useState(6);
+  const [visionRadiusInput, setVisionRadiusInput] = useState(6);
+  const [clearRulerSignal, setClearRulerSignal] = useState(0);
   const [status, setStatus] = useState("Starting session...");
   const [currentPeerId, setCurrentPeerId] = useState("dm-web");
   const [currentPeerToken, setCurrentPeerToken] = useState<string | undefined>(undefined);
@@ -98,18 +138,44 @@ export default function App() {
       getEncounterTemplates(sessionId, context),
       listCharacters(sessionId, context),
     ]);
+    const [journalResp, handoutsResp, assetsResp] = await Promise.all([
+      listJournalEntries(sessionId, context),
+      listHandouts(sessionId, context),
+      listAssets(sessionId, context),
+    ]);
+    const role =
+      (sessionResp.peer_roles && sessionResp.peer_roles[currentPeerId]) ||
+      (currentPeerId === sessionResp.host_peer_id ? "GM" : "Player");
+    if (role === "GM" || role === "AssistantGM") {
+      const [macrosResp, rollTemplatesResp, pluginsResp] = await Promise.all([
+        listMacros(sessionId, context),
+        listRollTemplates(sessionId, context),
+        listPlugins(sessionId, context),
+      ]);
+      setMacros(macrosResp.macros);
+      setRollTemplates(rollTemplatesResp.roll_templates);
+      setPlugins(pluginsResp.plugins);
+    } else {
+      setMacros([]);
+      setRollTemplates([]);
+      setPlugins([]);
+    }
     setSession(sessionResp);
     setSnapshot(stateResp.state);
     setTutorial(tutorialResp);
     setNotes(notesResp.notes);
     setTemplates(templatesResp.encounter_templates);
     setCharacters(charsResp.characters);
+    setJournalEntries(journalResp.journal_entries);
+    setHandouts(handoutsResp.handouts);
+    setAssetLibrary(assetsResp.assets);
     setStatus(`Active session: ${sessionResp.session_name} as ${currentPeerId}`);
   }
 
   function commandContext(): CommandContext {
     return {
       actor_peer_id: currentPeerId,
+      actor_token: currentPeerToken,
       actor_role: currentRole,
     };
   }
@@ -117,6 +183,7 @@ export default function App() {
   const canMutate = currentRole !== "Observer";
   const canUseGMTools = currentRole === "GM" || currentRole === "AssistantGM";
   const canEditMap = canUseGMTools;
+  const visibilityMaskActive = !canUseGMTools && Object.keys(snapshot.map.visibility_cells_by_token ?? {}).length > 0;
   const ownedActorIds = useMemo(() => new Set(Object.keys(snapshot.actors)), [snapshot.actors]);
 
   function canControlToken(tokenId: string): boolean {
@@ -129,6 +196,20 @@ export default function App() {
     setLoadingSession(true);
     try {
       const created = await createSession(sessionName, hostPeerId);
+      setCurrentPeerId(hostPeerId);
+      setCurrentPeerToken(created.host_peer_token);
+      await refreshSessionData(created.session_id);
+    } catch (err) {
+      setStatus(`Host error: ${(err as Error).message}`);
+    } finally {
+      setLoadingSession(false);
+    }
+  }
+
+  async function handleHostInCampaign(sessionName: string, hostPeerId: string, campaignId: string) {
+    setLoadingSession(true);
+    try {
+      const created = await createSessionInCampaign(sessionName, hostPeerId, campaignId);
       setCurrentPeerId(hostPeerId);
       setCurrentPeerToken(created.host_peer_token);
       await refreshSessionData(created.session_id);
@@ -286,6 +367,114 @@ export default function App() {
     setStatus("Encounter template added");
   }
 
+  async function handleCreateJournalEntry(title: string, content: string) {
+    if (!session || !canUseGMTools) return;
+    await createJournalEntry(session.session_id, title, content, commandContext());
+    const resp = await listJournalEntries(session.session_id, readContext());
+    setJournalEntries(resp.journal_entries);
+  }
+
+  async function handleUpdateJournalEntry(entryId: string, title: string, content: string) {
+    if (!session || !canUseGMTools) return;
+    await updateJournalEntry(session.session_id, entryId, title, content, commandContext());
+    const resp = await listJournalEntries(session.session_id, readContext());
+    setJournalEntries(resp.journal_entries);
+  }
+
+  async function handleShareJournalEntry(
+    entryId: string,
+    sharedRoles: string[],
+    sharedPeerIds: string[],
+    editableRoles: string[],
+    editablePeerIds: string[],
+  ) {
+    if (!session || !canUseGMTools) return;
+    await shareJournalEntry(session.session_id, entryId, sharedRoles, sharedPeerIds, editableRoles, editablePeerIds, commandContext());
+    const resp = await listJournalEntries(session.session_id, readContext());
+    setJournalEntries(resp.journal_entries);
+  }
+
+  async function handleCreateHandout(title: string, body: string) {
+    if (!session || !canUseGMTools) return;
+    await createHandout(session.session_id, title, body, commandContext());
+    const resp = await listHandouts(session.session_id, readContext());
+    setHandouts(resp.handouts);
+  }
+
+  async function handleUpdateHandout(handoutId: string, title: string, body: string) {
+    if (!session || !canUseGMTools) return;
+    await updateHandout(session.session_id, handoutId, title, body, commandContext());
+    const resp = await listHandouts(session.session_id, readContext());
+    setHandouts(resp.handouts);
+  }
+
+  async function handleShareHandout(
+    handoutId: string,
+    sharedRoles: string[],
+    sharedPeerIds: string[],
+    editableRoles: string[],
+    editablePeerIds: string[],
+  ) {
+    if (!session || !canUseGMTools) return;
+    await shareHandout(session.session_id, handoutId, sharedRoles, sharedPeerIds, editableRoles, editablePeerIds, commandContext());
+    const resp = await listHandouts(session.session_id, readContext());
+    setHandouts(resp.handouts);
+  }
+
+  async function handleAddAssetLibraryItem(nextAssetId: string, name: string, uri: string) {
+    if (!session || !canUseGMTools) return;
+    await addAssetLibraryItem(
+      session.session_id,
+      { asset_id: nextAssetId, name, asset_type: "stamp", uri, tags: [], license: null },
+      commandContext(),
+    );
+    const resp = await listAssets(session.session_id, readContext());
+    setAssetLibrary(resp.assets);
+    setAssetId(nextAssetId);
+  }
+
+  async function handleCreateMacro(name: string, template: string) {
+    if (!session || !canUseGMTools) return;
+    await createMacro(session.session_id, name, template, commandContext());
+    const resp = await listMacros(session.session_id, readContext());
+    setMacros(resp.macros);
+  }
+
+  async function handleRunMacro(macroId: string, variables: Record<string, string>): Promise<string> {
+    if (!session || !canUseGMTools) return "";
+    const resp = await runMacro(session.session_id, macroId, variables, commandContext());
+    setStatus(`Macro executed by ${resp.execution.actor_peer_id ?? "unknown actor"}`);
+    return resp.result;
+  }
+
+  async function handleCreateRollTemplate(name: string, template: string, actionBlocks: Record<string, string>) {
+    if (!session || !canUseGMTools) return;
+    await createRollTemplate(session.session_id, name, template, actionBlocks, commandContext());
+    const resp = await listRollTemplates(session.session_id, readContext());
+    setRollTemplates(resp.roll_templates);
+  }
+
+  async function handleRenderRollTemplate(rollTemplateId: string, variables: Record<string, string>): Promise<string> {
+    if (!session || !canUseGMTools) return "";
+    const resp = await renderRollTemplate(session.session_id, rollTemplateId, variables, commandContext());
+    setStatus(`Roll template rendered by ${resp.render.actor_peer_id ?? "unknown actor"}`);
+    return resp.rendered;
+  }
+
+  async function handleRegisterPlugin(name: string, version: string, capabilities: string[]) {
+    if (!session || !canUseGMTools) return;
+    await registerPlugin(session.session_id, name, version, capabilities, commandContext());
+    const resp = await listPlugins(session.session_id, readContext());
+    setPlugins(resp.plugins);
+  }
+
+  async function handleExecutePluginHook(pluginId: string, hookName: string, payload: Record<string, unknown>): Promise<string> {
+    if (!session || !canUseGMTools) return "forbidden";
+    const resp = await executePluginHook(session.session_id, pluginId, hookName, payload, commandContext());
+    setStatus(`Plugin hook ${hookName} result: ${resp.status}`);
+    return resp.status;
+  }
+
   async function handleToggleFog() {
     if (!session) return;
     if (!canUseGMTools) return;
@@ -319,6 +508,15 @@ export default function App() {
     if (!canUseGMTools) return;
     const resp = await stampAsset(session.session_id, x, y, nextAssetId, commandContext());
     setSnapshot(resp.state);
+  }
+
+  async function handleSetTokenVisionRadius() {
+    if (!session || !canUseGMTools) return;
+    if (!selectedLeadToken) return;
+    const radius = Math.max(0, Math.floor(visionRadiusInput));
+    const resp = await setTokenVisionRadius(session.session_id, selectedLeadToken, radius, commandContext());
+    setSnapshot(resp.state);
+    setStatus(`Set vision radius ${radius} for ${selectedLeadToken}`);
   }
 
   async function handleReorderInitiative(nextOrder: string[]) {
@@ -378,6 +576,27 @@ export default function App() {
     setContextMenu(null);
   }
 
+  function quickMeasureFromSelectedToContextToken() {
+    if (!contextMenu) return;
+    const sourceId = selectedLeadToken;
+    const targetId = contextMenu.tokenId;
+    const source = snapshot.map.token_positions[sourceId];
+    const target = snapshot.map.token_positions[targetId];
+    if (!source || !target) {
+      setStatus("Unable to start measurement: source or target token is missing.");
+      setContextMenu(null);
+      return;
+    }
+    setActiveTool("ruler");
+    setRulerPreset({
+      start: { x: source[0], y: source[1] },
+      end: { x: target[0], y: target[1] },
+      nonce: Date.now(),
+    });
+    setStatus(`Measured from ${sourceId} to ${targetId}`);
+    setContextMenu(null);
+  }
+
   if (!session) {
     return (
       <div className="app-shell app-shell-single">
@@ -396,7 +615,20 @@ export default function App() {
         <div className="panel toolbar">
           <span className="token-chip">Peer: {currentPeerId}</span>
           <span className="token-chip">Role: {currentRole}</span>
+          {visibilityMaskActive && <span className="token-chip">Visibility mask active</span>}
           <span className="token-chip">Session: {session.session_id}</span>
+          {canUseGMTools && (
+            <>
+              <input
+                type="number"
+                min={0}
+                value={visionRadiusInput}
+                onChange={(e) => setVisionRadiusInput(Number(e.target.value))}
+                style={{ width: 72 }}
+              />
+              <button onClick={() => void handleSetTokenVisionRadius()}>Set Vision Radius</button>
+            </>
+          )}
           <select value={selectedLeadToken} onChange={(e) => setSelectedTokens([e.target.value])}>
             {tokenIds.map((tokenId) => (
               <option key={tokenId} value={tokenId}>
@@ -429,10 +661,20 @@ export default function App() {
           canEditMap={canEditMap}
           canMoveTokens={canMutate}
           canControlToken={canControlToken}
+          useVisibilityMask={!canUseGMTools}
+          movementBudgetCells={movementBudgetCells}
+          rulerPreset={rulerPreset}
+          clearRulerSignal={clearRulerSignal}
         />
       </div>
       <div className="side-stack">
         <SessionLobbyPanel onHostSession={handleHostSession} onJoinSession={handleJoinSession} loading={loadingSession} />
+        <button
+          disabled={loadingSession || !session.campaign_id}
+          onClick={() => void handleHostInCampaign("Reuse Campaign Session", currentPeerId, session.campaign_id ?? "")}
+        >
+          Host New Session In Campaign
+        </button>
         <PermissionsPanel
           peers={session.peers}
           peerRoles={session.peer_roles ?? {}}
@@ -446,9 +688,14 @@ export default function App() {
           activeTool={activeTool}
           terrainType={terrainType}
           assetId={assetId}
+          assetOptions={assetLibrary.map((asset) => ({ asset_id: asset.asset_id, name: asset.name }))}
           onSelectTool={setActiveTool}
           onTerrainTypeChange={setTerrainType}
           onAssetIdChange={setAssetId}
+          movementBudgetCells={movementBudgetCells}
+          onMovementBudgetCellsChange={setMovementBudgetCells}
+          onClearRuler={() => setClearRulerSignal((prev) => prev + 1)}
+          onAddAssetOption={handleAddAssetLibraryItem}
           canEditMap={canEditMap}
         />
         <InitiativePanel snapshot={snapshot} onReorder={handleReorderInitiative} canEdit={canUseGMTools} />
@@ -460,6 +707,35 @@ export default function App() {
           onSaveNotes={handleSaveNotes}
           onAddTemplate={handleAddTemplate}
           canEdit={canUseGMTools}
+        />
+        <JournalPanel
+          entries={journalEntries}
+          peers={session.peers}
+          canManage={canUseGMTools}
+          onCreate={handleCreateJournalEntry}
+          onUpdate={handleUpdateJournalEntry}
+          onShare={handleShareJournalEntry}
+        />
+        <HandoutPanel
+          handouts={handouts}
+          peers={session.peers}
+          canManage={canUseGMTools}
+          onCreate={handleCreateHandout}
+          onUpdate={handleUpdateHandout}
+          onShare={handleShareHandout}
+        />
+        <MacroPanel macros={macros} canManage={canUseGMTools} onCreate={handleCreateMacro} onRun={handleRunMacro} />
+        <RollTemplatePanel
+          rollTemplates={rollTemplates}
+          canManage={canUseGMTools}
+          onCreate={handleCreateRollTemplate}
+          onRender={handleRenderRollTemplate}
+        />
+        <PluginPanel
+          plugins={plugins}
+          canManage={canUseGMTools}
+          onRegister={handleRegisterPlugin}
+          onExecuteHook={handleExecutePluginHook}
         />
         <TutorialPanel tutorial={tutorial} />
         <div className="panel side-panel">
@@ -476,6 +752,7 @@ export default function App() {
 
       {contextMenu && (
         <div className="context-menu" style={{ left: contextMenu.x, top: contextMenu.y }}>
+          <button onClick={quickMeasureFromSelectedToContextToken}>Measure From Selected</button>
           <button onClick={() => void applyTokenQuickAction("damage")}>Apply Damage</button>
           <button onClick={() => void applyTokenQuickAction("heal")}>Heal</button>
           <button onClick={() => void applyTokenQuickAction("condition")}>Add Condition</button>

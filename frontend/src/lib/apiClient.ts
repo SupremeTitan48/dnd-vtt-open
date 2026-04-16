@@ -1,8 +1,24 @@
-import type { CharacterSheet, EncounterTemplate, Session, SessionEvent, Snapshot, Tutorial } from "../types";
+import type {
+  AssetLibraryItem,
+  CharacterSheet,
+  EncounterTemplate,
+  Handout,
+  JournalEntry,
+  Macro,
+  MacroExecution,
+  Plugin,
+  RollTemplate,
+  RollTemplateRender,
+  Session,
+  SessionEvent,
+  Snapshot,
+  Tutorial,
+} from "../types";
 
 const API_BASE = "/api";
 export type CommandContext = {
   actor_peer_id?: string;
+  actor_token?: string;
   actor_role?: "GM" | "AssistantGM" | "Player" | "Observer";
   expected_revision?: number;
   idempotency_key?: string;
@@ -57,6 +73,13 @@ export function createSession(sessionName: string, hostPeerId: string): Promise<
   return request<Session>("/sessions", {
     method: "POST",
     body: JSON.stringify({ session_name: sessionName, host_peer_id: hostPeerId }),
+  });
+}
+
+export function createSessionInCampaign(sessionName: string, hostPeerId: string, campaignId: string): Promise<Session> {
+  return request<Session>("/sessions", {
+    method: "POST",
+    body: JSON.stringify({ session_name: sessionName, host_peer_id: hostPeerId, campaign_id: campaignId }),
   });
 }
 
@@ -268,4 +291,226 @@ export function addEncounterTemplate(
 
 export function getEncounterTemplates(sessionId: string, context?: ReadContext): Promise<{ session_id: string; encounter_templates: EncounterTemplate[] }> {
   return request(appendReadContext(`/sessions/${sessionId}/encounter-templates`, context));
+}
+
+export function listJournalEntries(sessionId: string, context?: ReadContext): Promise<{ session_id: string; journal_entries: JournalEntry[] }> {
+  return request(appendReadContext(`/sessions/${sessionId}/journal-entries`, context));
+}
+
+export function createJournalEntry(
+  sessionId: string,
+  title: string,
+  content: string,
+  command?: CommandContext,
+): Promise<{ session_id: string; entry: JournalEntry; revision: number }> {
+  return request(`/sessions/${sessionId}/journal-entries`, {
+    method: "POST",
+    body: JSON.stringify({ title, content, command }),
+  });
+}
+
+export function updateJournalEntry(
+  sessionId: string,
+  entryId: string,
+  title: string,
+  content: string,
+  command?: CommandContext,
+): Promise<{ session_id: string; entry: JournalEntry; revision: number }> {
+  return request(`/sessions/${sessionId}/journal-entries/${entryId}`, {
+    method: "PUT",
+    body: JSON.stringify({ title, content, command }),
+  });
+}
+
+export function shareJournalEntry(
+  sessionId: string,
+  entryId: string,
+  sharedRoles: string[],
+  sharedPeerIds: string[],
+  editableRoles: string[],
+  editablePeerIds: string[],
+  command?: CommandContext,
+): Promise<{ session_id: string; entry: JournalEntry; revision: number }> {
+  return request(`/sessions/${sessionId}/journal-entries/${entryId}/share`, {
+    method: "POST",
+    body: JSON.stringify({
+      shared_roles: sharedRoles,
+      shared_peer_ids: sharedPeerIds,
+      editable_roles: editableRoles,
+      editable_peer_ids: editablePeerIds,
+      command,
+    }),
+  });
+}
+
+export function listHandouts(sessionId: string, context?: ReadContext): Promise<{ session_id: string; handouts: Handout[] }> {
+  return request(appendReadContext(`/sessions/${sessionId}/handouts`, context));
+}
+
+export function createHandout(
+  sessionId: string,
+  title: string,
+  body: string,
+  command?: CommandContext,
+): Promise<{ session_id: string; handout: Handout; revision: number }> {
+  return request(`/sessions/${sessionId}/handouts`, {
+    method: "POST",
+    body: JSON.stringify({ title, body, command }),
+  });
+}
+
+export function updateHandout(
+  sessionId: string,
+  handoutId: string,
+  title: string,
+  body: string,
+  command?: CommandContext,
+): Promise<{ session_id: string; handout: Handout; revision: number }> {
+  return request(`/sessions/${sessionId}/handouts/${handoutId}`, {
+    method: "PUT",
+    body: JSON.stringify({ title, body, command }),
+  });
+}
+
+export function shareHandout(
+  sessionId: string,
+  handoutId: string,
+  sharedRoles: string[],
+  sharedPeerIds: string[],
+  editableRoles: string[],
+  editablePeerIds: string[],
+  command?: CommandContext,
+): Promise<{ session_id: string; handout: Handout; revision: number }> {
+  return request(`/sessions/${sessionId}/handouts/${handoutId}/share`, {
+    method: "POST",
+    body: JSON.stringify({
+      shared_roles: sharedRoles,
+      shared_peer_ids: sharedPeerIds,
+      editable_roles: editableRoles,
+      editable_peer_ids: editablePeerIds,
+      command,
+    }),
+  });
+}
+
+export function listAssets(sessionId: string, context?: ReadContext): Promise<{ session_id: string; assets: AssetLibraryItem[] }> {
+  return request(appendReadContext(`/sessions/${sessionId}/assets`, context));
+}
+
+export function addAssetLibraryItem(
+  sessionId: string,
+  item: Omit<AssetLibraryItem, "created_at">,
+  command?: CommandContext,
+): Promise<{ session_id: string; asset: AssetLibraryItem; revision: number }> {
+  return request(`/sessions/${sessionId}/assets`, {
+    method: "POST",
+    body: JSON.stringify({
+      asset_id: item.asset_id,
+      name: item.name,
+      asset_type: item.asset_type,
+      uri: item.uri,
+      tags: item.tags,
+      license: item.license,
+      command,
+    }),
+  });
+}
+
+export function setTokenVisionRadius(
+  sessionId: string,
+  tokenId: string,
+  radius: number,
+  command?: CommandContext,
+): Promise<{ session_id: string; state: Snapshot }> {
+  return request(`/sessions/${sessionId}/token-vision`, {
+    method: "POST",
+    body: JSON.stringify({ token_id: tokenId, radius, command }),
+  });
+}
+
+export function listMacros(sessionId: string, context?: ReadContext): Promise<{ session_id: string; macros: Macro[] }> {
+  return request(appendReadContext(`/sessions/${sessionId}/macros`, context));
+}
+
+export function createMacro(
+  sessionId: string,
+  name: string,
+  template: string,
+  command?: CommandContext,
+): Promise<{ session_id: string; macro: Macro; revision: number }> {
+  return request(`/sessions/${sessionId}/macros`, {
+    method: "POST",
+    body: JSON.stringify({ name, template, command }),
+  });
+}
+
+export function runMacro(
+  sessionId: string,
+  macroId: string,
+  variables: Record<string, string>,
+  command?: CommandContext,
+): Promise<{ session_id: string; macro_id: string; result: string; execution: MacroExecution; revision: number }> {
+  return request(`/sessions/${sessionId}/macros/${macroId}/run`, {
+    method: "POST",
+    body: JSON.stringify({ variables, command }),
+  });
+}
+
+export function listRollTemplates(sessionId: string, context?: ReadContext): Promise<{ session_id: string; roll_templates: RollTemplate[] }> {
+  return request(appendReadContext(`/sessions/${sessionId}/roll-templates`, context));
+}
+
+export function createRollTemplate(
+  sessionId: string,
+  name: string,
+  template: string,
+  actionBlocks: Record<string, string>,
+  command?: CommandContext,
+): Promise<{ session_id: string; roll_template: RollTemplate; revision: number }> {
+  return request(`/sessions/${sessionId}/roll-templates`, {
+    method: "POST",
+    body: JSON.stringify({ name, template, action_blocks: actionBlocks, command }),
+  });
+}
+
+export function renderRollTemplate(
+  sessionId: string,
+  rollTemplateId: string,
+  variables: Record<string, string>,
+  command?: CommandContext,
+): Promise<{ session_id: string; roll_template_id: string; rendered: string; render: RollTemplateRender; revision: number }> {
+  return request(`/sessions/${sessionId}/roll-templates/${rollTemplateId}/render`, {
+    method: "POST",
+    body: JSON.stringify({ variables, command }),
+  });
+}
+
+export function listPlugins(sessionId: string, context?: ReadContext): Promise<{ session_id: string; plugins: Plugin[] }> {
+  return request(appendReadContext(`/sessions/${sessionId}/plugins`, context));
+}
+
+export function registerPlugin(
+  sessionId: string,
+  name: string,
+  version: string,
+  capabilities: string[],
+  command?: CommandContext,
+): Promise<{ session_id: string; plugin: Plugin; revision: number }> {
+  return request(`/sessions/${sessionId}/plugins`, {
+    method: "POST",
+    body: JSON.stringify({ name, version, capabilities, command }),
+  });
+}
+
+export function executePluginHook(
+  sessionId: string,
+  pluginId: string,
+  hookName: string,
+  payload: Record<string, unknown>,
+  command?: CommandContext,
+): Promise<{ session_id: string; plugin_id: string; hook_name: string; status: string; error?: string; revision: number }> {
+  return request(`/sessions/${sessionId}/plugins/${pluginId}/hooks/${hookName}/execute`, {
+    method: "POST",
+    body: JSON.stringify({ payload, command }),
+  });
 }
