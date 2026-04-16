@@ -123,6 +123,30 @@ describe("Phase 4 panels", () => {
     expect(onRun).not.toHaveBeenCalled();
   });
 
+  it("shows backend failure feedback when macro run fails", async () => {
+    const user = userEvent.setup();
+    const onRun = vi.fn().mockRejectedValue(new Error("Permission denied for macro:mutate"));
+    render(
+      <MacroPanel
+        macros={[
+          {
+            macro_id: "m1",
+            name: "Cast",
+            template: "{actor} casts {spell}",
+            created_at: new Date().toISOString(),
+            updated_at: new Date().toISOString(),
+          },
+        ]}
+        canManage
+        onCreate={vi.fn()}
+        onRun={onRun}
+      />,
+    );
+    await user.selectOptions(screen.getByRole("combobox"), "m1");
+    await user.click(screen.getByRole("button", { name: "Run Macro" }));
+    expect(screen.getByText("Permission denied for macro:mutate")).toBeTruthy();
+  });
+
   it("shows validation for malformed plugin capabilities and blocks register", async () => {
     const user = userEvent.setup();
     const onRegister = vi.fn().mockResolvedValue(undefined);
@@ -133,5 +157,51 @@ describe("Phase 4 panels", () => {
     await user.click(screen.getByRole("button", { name: "Register Plugin" }));
     expect(screen.getByText("Invalid capabilities (expected domain:action): badcap")).toBeTruthy();
     expect(onRegister).not.toHaveBeenCalled();
+  });
+
+  it("shows validation for empty plugin capability segment and blocks register", async () => {
+    const user = userEvent.setup();
+    const onRegister = vi.fn().mockResolvedValue(undefined);
+    render(<PluginPanel plugins={[]} canManage onRegister={onRegister} onExecuteHook={vi.fn()} />);
+    await user.type(screen.getByPlaceholderText("Plugin name"), "MyPlugin");
+    await user.clear(screen.getByPlaceholderText("Capabilities (one per line or comma separated)"));
+    await user.type(screen.getByPlaceholderText("Capabilities (one per line or comma separated)"), "macro:");
+    await user.click(screen.getByRole("button", { name: "Register Plugin" }));
+    expect(screen.getByText("Invalid capabilities (expected domain:action): macro:")).toBeTruthy();
+    expect(onRegister).not.toHaveBeenCalled();
+  });
+
+  it("shows backend failure feedback when roll template render fails", async () => {
+    const user = userEvent.setup();
+    const onRender = vi.fn().mockRejectedValue(new Error("Roll template not found"));
+    render(
+      <RollTemplatePanel
+        rollTemplates={[
+          {
+            roll_template_id: "rt1",
+            name: "Attack",
+            template: "{actor} uses {attack}",
+            action_blocks: { attack: "Longsword" },
+            created_at: new Date().toISOString(),
+            updated_at: new Date().toISOString(),
+          },
+        ]}
+        canManage
+        onCreate={vi.fn()}
+        onRender={onRender}
+      />,
+    );
+    await user.selectOptions(screen.getByRole("combobox"), "rt1");
+    await user.click(screen.getByRole("button", { name: "Render" }));
+    expect(screen.getByText("Roll template not found")).toBeTruthy();
+  });
+
+  it("shows backend failure feedback when plugin register fails", async () => {
+    const user = userEvent.setup();
+    const onRegister = vi.fn().mockRejectedValue(new Error("Permission denied for plugin:mutate"));
+    render(<PluginPanel plugins={[]} canManage onRegister={onRegister} onExecuteHook={vi.fn()} />);
+    await user.type(screen.getByPlaceholderText("Plugin name"), "Hooks");
+    await user.click(screen.getByRole("button", { name: "Register Plugin" }));
+    expect(screen.getByText("Permission denied for plugin:mutate")).toBeTruthy();
   });
 });

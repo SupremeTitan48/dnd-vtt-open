@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import secrets
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from app.policies.access_control import PermissionDeniedError, can_access_resource, can_view_gm_secrets, resolve_actor_role
 from content.character_import import import_character_by_format
@@ -41,6 +42,7 @@ class SessionService:
     sessions: dict[str, dict[str, Any]] = field(default_factory=dict)
     engines: dict[str, GameStateEngine] = field(default_factory=dict)
     campaigns: dict[str, dict[str, Any]] = field(default_factory=dict)
+    plugin_hook_executor: Callable[[dict[str, Any], str, dict[str, Any]], dict[str, Any]] | None = None
     allowed_roles: set[str] = field(default_factory=lambda: {'GM', 'AssistantGM', 'Player', 'Observer'})
 
     def _ensure_metadata(self, session_id: str) -> None:
@@ -77,6 +79,7 @@ class SessionService:
                 'roll_template_renders': [],
                 'plugins': [],
                 'plugin_hook_executions': [],
+                'backup_audit': [],
             }
 
     def _campaign_for_session(self, session_id: str) -> dict[str, Any]:
@@ -1152,14 +1155,19 @@ class SessionService:
         }
         campaign['plugin_hook_executions'].append(execution)
         self._increment_revision(session_id)
-
-        if payload.get('simulate_failure'):
+        try:
+            if payload.get('simulate_failure'):
+                raise RuntimeError('simulated plugin hook failure')
+            if self.plugin_hook_executor is not None:
+                hook_result = self.plugin_hook_executor(plugin, hook_name, payload)
+                execution['result'] = hook_result
+        except Exception:
             return {
                 'session_id': session_id,
                 'plugin_id': plugin_id,
                 'hook_name': hook_name,
                 'status': 'isolated_failure',
-                'error': 'simulated plugin hook failure',
+                'error': 'plugin hook execution failed',
                 'execution': execution,
                 'revision': self._current_revision(session_id),
             }
@@ -1249,6 +1257,156 @@ class SessionService:
             )
         )
         return path
+
+    def backup(self, session_id: str) -> dict[str, Any] | None:
+        engine = self.get_engine(session_id)
+        session = self.sessions.get(session_id)
+        if not engine or session is None:
+            return None
+        self._ensure_metadata(session_id)
+        campaign = self._campaign_for_session(session_id)
+        events_path = self.store.base_dir / 'events' / f'{session_id}.jsonl'
+        events: list[dict[str, Any]] = []
+        if events_path.exists():
+            for line in events_path.read_text().splitlines():
+                if line.strip():
+                    events.append(json.loads(line))
+
+        backup_id = f'{session_id}-{datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")}-{secrets.token_hex(3)}'
+        backup_dir = self.store.base_dir / 'backups'
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        backup_path = backup_dir / f'{backup_id}.json'
+        backup_path.write_text(
+            json.dumps(
+                {
+                    'backup_id': backup_id,
+                    'session_id': session_id,
+                    'created_at': datetime.now(timezone.utc).isoformat(),
+                    'snapshot': engine.snapshot(),
+                    'session': session,
+                    'campaign': campaign,
+                    'events': events,
+                },
+                indent=2,
+            )
+        )
+        return {'backup_id': backup_id, 'backup_path': backup_path}
+
+    def restore_backup(self, session_id: str, backup_id: str) -> dict[str, Any] | None:
+        backup_path = self.store.base_dir / 'backups' / f'{backup_id}.json'
+        if not backup_path.exists():
+            return None
+        backup_payload = json.loads(backup_path.read_text())
+        if str(backup_payload.get('session_id')) != session_id:
+            raise SessionPermissionError('Backup does not match session id')
+
+        snapshot = backup_payload.get('snapshot')
+        session = backup_payload.get('session')
+        campaign = backup_payload.get('campaign')
+        events = backup_payload.get('events', [])
+        if not isinstance(snapshot, dict) or not isinstance(session, dict) or not isinstance(campaign, dict):
+            raise SessionPermissionError('Backup payload is invalid')
+
+        self.engines[session_id] = GameStateEngine.from_snapshot(snapshot)
+        self.sessions[session_id] = session
+        campaign_id = str(session.get('campaign_id', session_id))
+        self.campaigns[campaign_id] = campaign
+        self._ensure_metadata(session_id)
+        self.save(session_id)
+
+        events_dir = self.store.base_dir / 'events'
+        events_dir.mkdir(parents=True, exist_ok=True)
+        events_path = events_dir / f'{session_id}.jsonl'
+        serialized = ''
+        if isinstance(events, list):
+            serialized = ''.join(f'{json.dumps(event)}\n' for event in events if isinstance(event, dict))
+        events_path.write_text(serialized)
+        return self._state_with_revision(session_id)
+
+    def list_backups(self, session_id: str) -> list[dict[str, Any]]:
+        backup_dir = self.store.base_dir / 'backups'
+        if not backup_dir.exists():
+            return []
+        backups: list[dict[str, Any]] = []
+        for backup_file in backup_dir.glob(f'{session_id}-*.json'):
+            payload = json.loads(backup_file.read_text())
+            backups.append(
+                {
+                    'backup_id': str(payload.get('backup_id', backup_file.stem)),
+                    'session_id': str(payload.get('session_id', session_id)),
+                    'created_at': str(payload.get('created_at', '')),
+                    'backup_path': str(backup_file),
+                }
+            )
+        backups.sort(key=lambda item: item.get('created_at', ''), reverse=True)
+        return backups
+
+    def prune_backups(self, session_id: str, keep_latest: int) -> dict[str, int]:
+        backups = self.list_backups(session_id)
+        to_keep = backups[:keep_latest]
+        keep_ids = {backup['backup_id'] for backup in to_keep}
+        deleted = 0
+        for backup in backups:
+            if backup['backup_id'] in keep_ids:
+                continue
+            backup_path = Path(backup['backup_path'])
+            if backup_path.exists():
+                backup_path.unlink()
+                deleted += 1
+        return {'kept': len(to_keep), 'deleted': deleted}
+
+    def export_backup(self, session_id: str, backup_id: str) -> dict[str, Any] | None:
+        backup_path = self.store.base_dir / 'backups' / f'{backup_id}.json'
+        if not backup_path.exists():
+            return None
+        backup = json.loads(backup_path.read_text())
+        if str(backup.get('session_id')) != session_id:
+            raise SessionPermissionError('Backup does not match session id')
+        canonical = json.dumps(backup, sort_keys=True, separators=(',', ':')).encode('utf-8')
+        checksum = hashlib.sha256(canonical).hexdigest()
+        return {'backup': backup, 'checksum_sha256': checksum}
+
+    def import_backup(self, session_id: str, backup: dict[str, Any], checksum_sha256: str) -> dict[str, Any]:
+        if str(backup.get('session_id')) != session_id:
+            raise SessionPermissionError('Backup does not match session id')
+        canonical = json.dumps(backup, sort_keys=True, separators=(',', ':')).encode('utf-8')
+        computed = hashlib.sha256(canonical).hexdigest()
+        if computed != checksum_sha256:
+            raise SessionPermissionError('Backup checksum mismatch')
+        backup_dir = self.store.base_dir / 'backups'
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        imported_backup_id = f'{session_id}-{datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")}-{secrets.token_hex(3)}'
+        backup['backup_id'] = imported_backup_id
+        backup['imported_at'] = datetime.now(timezone.utc).isoformat()
+        backup_path = backup_dir / f'{imported_backup_id}.json'
+        backup_path.write_text(json.dumps(backup, indent=2))
+        return {'backup_id': imported_backup_id, 'backup_path': backup_path}
+
+    def record_backup_audit(
+        self,
+        session_id: str,
+        *,
+        actor_peer_id: str | None,
+        action: str,
+        detail: dict[str, Any] | None = None,
+    ) -> None:
+        campaign = self._campaign_for_session(session_id)
+        campaign.setdefault('backup_audit', []).append(
+            {
+                'audit_id': secrets.token_hex(8),
+                'action': action,
+                'actor_peer_id': actor_peer_id,
+                'detail': detail or {},
+                'recorded_at': datetime.now(timezone.utc).isoformat(),
+            }
+        )
+
+    def get_backup_audit(self, session_id: str) -> list[dict[str, Any]] | None:
+        session = self.sessions.get(session_id)
+        if not session:
+            return None
+        campaign = self._campaign_for_session(session_id)
+        return list(campaign.get('backup_audit', []))
 
     def load(self, session_id: str) -> dict[str, Any] | None:
         if not (self.store.base_dir / f'{session_id}.json').exists():

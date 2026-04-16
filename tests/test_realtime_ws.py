@@ -274,6 +274,51 @@ def test_player_websocket_redacts_unowned_actor_events() -> None:
         assert {} in event_payloads
 
 
+def test_non_gm_websocket_redacts_phase4_automation_events() -> None:
+    client = TestClient(app)
+    created = client.post('/api/sessions', json={"session_name": "WsPhase4Redaction", "host_peer_id": "dm"})
+    session_id = created.json()['session_id']
+    host_token = created.json()['host_peer_token']
+    host_command = {"actor_peer_id": "dm", "actor_token": host_token}
+
+    joined = client.post(f"/api/sessions/{session_id}/join", json={"peer_id": "p1"})
+    assert joined.status_code == 200
+    p1_token = joined.json()['peer_token']
+
+    with client.websocket_connect(f"/api/sessions/{session_id}/events?actor_peer_id=p1&actor_token={p1_token}") as ws:
+        ws.send_text('subscribe')
+        created_macro = client.post(
+            f"/api/sessions/{session_id}/macros",
+            json={"name": "Cast", "template": "{actor} casts {spell}.", "command": host_command},
+        )
+        assert created_macro.status_code == 200
+        macro_id = created_macro.json()['macro']['macro_id']
+
+        ran_macro = client.post(
+            f"/api/sessions/{session_id}/macros/{macro_id}/run",
+            json={"variables": {"actor": "Nyx", "spell": "Shield"}, "command": host_command},
+        )
+        assert ran_macro.status_code == 200
+
+        registered_plugin = client.post(
+            f"/api/sessions/{session_id}/plugins",
+            json={"name": "Hooks", "version": "1.0.0", "capabilities": ["macro:run"], "command": host_command},
+        )
+        assert registered_plugin.status_code == 200
+        plugin_id = registered_plugin.json()['plugin']['plugin_id']
+
+        hook_failed = client.post(
+            f"/api/sessions/{session_id}/plugins/{plugin_id}/hooks/after_event/execute",
+            json={"payload": {"event_type": "macro_ran", "simulate_failure": True}, "command": host_command},
+        )
+        assert hook_failed.status_code == 200
+
+        observed = [json.loads(ws.receive_text()) for _ in range(4)]
+        for event in observed:
+            assert event['event_type'] in {'macro_created', 'macro_ran', 'plugin_registered', 'plugin_hook_failed'}
+            assert event['payload'] == {}
+
+
 def test_visibility_recompute_emits_ws_event_and_replays_by_revision() -> None:
     client = TestClient(app)
     created = client.post('/api/sessions', json={"session_name": "VisionWS", "host_peer_id": "dm"})

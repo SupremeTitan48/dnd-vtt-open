@@ -37,6 +37,7 @@ export function MacroPanel({ macros, canManage, onCreate, onRun }: Props) {
   const [variablesInput, setVariablesInput] = useState("actor=Nyx,spell=Magic Missile");
   const [lastOutput, setLastOutput] = useState("");
   const [validationError, setValidationError] = useState("");
+  const [runtimeError, setRuntimeError] = useState("");
   const [saving, setSaving] = useState(false);
   const [running, setRunning] = useState(false);
 
@@ -59,10 +60,13 @@ export function MacroPanel({ macros, canManage, onCreate, onRun }: Props) {
         onClick={async () => {
           if (!name.trim() || !template.trim()) return;
           setSaving(true);
+          setRuntimeError("");
           try {
             await onCreate(name.trim(), template.trim());
             setName("");
             setTemplate("");
+          } catch (err) {
+            setRuntimeError(err instanceof Error ? err.message : "Failed to create macro.");
           } finally {
             setSaving(false);
           }
@@ -98,6 +102,7 @@ export function MacroPanel({ macros, canManage, onCreate, onRun }: Props) {
         disabled={!canManage || !runningMacroId || running}
         onClick={async () => {
           setRunning(true);
+          setRuntimeError("");
           try {
             const parsed = parseVariables(variablesInput);
             if (parsed.invalid.length) {
@@ -107,6 +112,8 @@ export function MacroPanel({ macros, canManage, onCreate, onRun }: Props) {
             setValidationError("");
             const output = await onRun(runningMacroId, parsed.values);
             setLastOutput(output);
+          } catch (err) {
+            setRuntimeError(err instanceof Error ? err.message : "Failed to run macro.");
           } finally {
             setRunning(false);
           }
@@ -115,6 +122,7 @@ export function MacroPanel({ macros, canManage, onCreate, onRun }: Props) {
         {running ? "Running..." : "Run Macro"}
       </button>
       {validationError && <div style={{ marginTop: 8, fontSize: 12, color: "#ff9b9b" }}>{validationError}</div>}
+      {runtimeError && <div style={{ marginTop: 8, fontSize: 12, color: "#ff9b9b" }}>{runtimeError}</div>}
       {lastOutput && <div style={{ marginTop: 8, fontSize: 12 }}>Last output: {lastOutput}</div>}
     </div>
   );

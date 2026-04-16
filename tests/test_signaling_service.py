@@ -1,6 +1,7 @@
 from fastapi.testclient import TestClient
 from pathlib import Path
 
+import api.http_api as http_api_module
 from api.http_api import session_service
 from net.signaling_service import app
 
@@ -82,6 +83,22 @@ def test_health_perf_reports_visibility_cache_metrics() -> None:
     assert isinstance(session_metrics['visibility_cache_hits'], int)
     assert isinstance(session_metrics['visibility_cache_misses'], int)
     assert isinstance(session_metrics['blocker_revision'], int)
+
+
+def test_health_ready_reports_basic_operational_checks() -> None:
+    client = TestClient(app)
+    response = client.get('/health/ready')
+    assert response.status_code == 200
+    body = response.json()
+    assert body['ok'] is True
+    checks = body['checks']
+    assert checks['session_store_dir'] is True
+    assert checks['event_log_dir'] is True
+    assert checks['migration_compatibility'] is True
+    migration = body['migration']
+    assert isinstance(migration['current_schema_version'], int)
+    assert isinstance(migration['min_supported_schema_version'], int)
+    assert migration['compatible'] is True
 
 
 def test_feature_endpoints_for_import_fog_and_dm_tools() -> None:
@@ -804,6 +821,186 @@ def test_phase2_campaign_content_survives_save_and_load() -> None:
     assert any(item['template_name'] == "DurableStart" for item in restored_templates.json()['encounter_templates'])
 
 
+def test_backup_and_restore_roundtrip_restores_previous_state() -> None:
+    client = TestClient(app)
+    created = client.post('/api/sessions', json={"session_name": "BackupRestore", "host_peer_id": "dm"})
+    session_id = created.json()['session_id']
+    host_token = created.json()['host_peer_token']
+    host_command = {"actor_peer_id": "dm", "actor_token": host_token}
+
+    moved = client.post(f'/api/sessions/{session_id}/move-token', json={"token_id": "hero", "x": 2, "y": 2})
+    assert moved.status_code == 200
+    assert moved.json()['state']['revision'] == 1
+
+    backup = client.post(f'/api/sessions/{session_id}/backup', json={"command": host_command})
+    assert backup.status_code == 200
+    backup_id = backup.json()['backup_id']
+    assert backup_id
+
+    changed = client.post(
+        f'/api/sessions/{session_id}/move-token',
+        json={"token_id": "hero", "x": 7, "y": 7, "command": {"expected_revision": 1}},
+    )
+    assert changed.status_code == 200
+    assert changed.json()['state']['map']['token_positions']['hero'] == [7, 7]
+    assert changed.json()['state']['revision'] == 2
+
+    restored = client.post(f'/api/sessions/{session_id}/restore-backup', json={"backup_id": backup_id, "command": host_command})
+    assert restored.status_code == 200
+    assert restored.json()['state']['map']['token_positions']['hero'] == [2, 2]
+    assert restored.json()['state']['revision'] == 1
+
+
+def test_list_and_prune_backups_retains_latest_entries() -> None:
+    client = TestClient(app)
+    created = client.post('/api/sessions', json={"session_name": "BackupRetention", "host_peer_id": "dm"})
+    session_id = created.json()['session_id']
+    host_token = created.json()['host_peer_token']
+    host_command = {"actor_peer_id": "dm", "actor_token": host_token}
+
+    first = client.post(f'/api/sessions/{session_id}/backup', json={"command": host_command})
+    second = client.post(f'/api/sessions/{session_id}/backup', json={"command": host_command})
+    third = client.post(f'/api/sessions/{session_id}/backup', json={"command": host_command})
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert third.status_code == 200
+
+    listed = client.get(f'/api/sessions/{session_id}/backups', params={"actor_peer_id": "dm", "actor_token": host_token})
+    assert listed.status_code == 200
+    backups = listed.json()['backups']
+    assert len(backups) >= 3
+
+    prune = client.post(f'/api/sessions/{session_id}/backups/prune', json={"keep_latest": 1, "command": host_command})
+    assert prune.status_code == 200
+    assert prune.json()['kept'] == 1
+    assert prune.json()['deleted'] >= 2
+
+    after = client.get(f'/api/sessions/{session_id}/backups', params={"actor_peer_id": "dm", "actor_token": host_token})
+    assert after.status_code == 200
+    assert len(after.json()['backups']) == 1
+
+
+def test_backup_export_and_import_with_checksum_validation() -> None:
+    client = TestClient(app)
+    created = client.post('/api/sessions', json={"session_name": "BackupPortability", "host_peer_id": "dm"})
+    session_id = created.json()['session_id']
+    host_token = created.json()['host_peer_token']
+    host_command = {"actor_peer_id": "dm", "actor_token": host_token}
+
+    moved = client.post(f'/api/sessions/{session_id}/move-token', json={"token_id": "hero", "x": 3, "y": 3})
+    assert moved.status_code == 200
+
+    backed_up = client.post(f'/api/sessions/{session_id}/backup', json={"command": host_command})
+    assert backed_up.status_code == 200
+    backup_id = backed_up.json()['backup_id']
+
+    exported = client.get(
+        f'/api/sessions/{session_id}/backups/{backup_id}/export',
+        params={"actor_peer_id": "dm", "actor_token": host_token},
+    )
+    assert exported.status_code == 200
+    export_body = exported.json()
+    assert export_body['session_id'] == session_id
+    assert export_body['backup']['backup_id'] == backup_id
+    assert len(export_body['checksum_sha256']) == 64
+
+    imported = client.post(
+        f'/api/sessions/{session_id}/backups/import',
+        json={"backup": export_body['backup'], "checksum_sha256": export_body['checksum_sha256'], "command": host_command},
+    )
+    assert imported.status_code == 200
+    imported_backup_id = imported.json()['backup_id']
+    assert imported_backup_id
+
+    tampered = client.post(
+        f'/api/sessions/{session_id}/backups/import',
+        json={"backup": export_body['backup'], "checksum_sha256": "0" * 64, "command": host_command},
+    )
+    assert tampered.status_code == 400
+
+
+def test_backup_operations_require_privileged_identity() -> None:
+    client = TestClient(app)
+    created = client.post('/api/sessions', json={"session_name": "BackupAuthz", "host_peer_id": "dm"})
+    session_id = created.json()['session_id']
+    host_token = created.json()['host_peer_token']
+    host_command = {"actor_peer_id": "dm", "actor_token": host_token}
+
+    joined = client.post(f"/api/sessions/{session_id}/join", json={"peer_id": "p1"})
+    assert joined.status_code == 200
+    p1_token = joined.json()['peer_token']
+    player_command = {"actor_peer_id": "p1", "actor_token": p1_token}
+
+    no_identity_backup = client.post(f'/api/sessions/{session_id}/backup')
+    no_identity_restore = client.post(f'/api/sessions/{session_id}/restore-backup', json={"backup_id": "x"})
+    no_identity_list = client.get(f'/api/sessions/{session_id}/backups')
+    no_identity_export = client.get(f'/api/sessions/{session_id}/backups/x/export')
+    no_identity_prune = client.post(f'/api/sessions/{session_id}/backups/prune', json={"keep_latest": 1})
+    no_identity_import = client.post(
+        f'/api/sessions/{session_id}/backups/import',
+        json={"backup": {"session_id": session_id}, "checksum_sha256": "0" * 64},
+    )
+
+    assert no_identity_backup.status_code == 403
+    assert no_identity_restore.status_code == 403
+    assert no_identity_list.status_code == 403
+    assert no_identity_export.status_code == 403
+    assert no_identity_prune.status_code == 403
+    assert no_identity_import.status_code == 403
+
+    player_backup = client.post(f'/api/sessions/{session_id}/backup', json={"command": player_command})
+    assert player_backup.status_code == 403
+
+    host_backup = client.post(f'/api/sessions/{session_id}/backup', json={"command": host_command})
+    assert host_backup.status_code == 200
+
+
+def test_backup_audit_log_and_rate_limit_behaviors() -> None:
+    client = TestClient(app)
+    created = client.post('/api/sessions', json={"session_name": "BackupAuditRate", "host_peer_id": "dm"})
+    session_id = created.json()['session_id']
+    host_token = created.json()['host_peer_token']
+    host_command = {"actor_peer_id": "dm", "actor_token": host_token}
+
+    backup = client.post(f'/api/sessions/{session_id}/backup', json={"command": host_command})
+    assert backup.status_code == 200
+    backup_id = backup.json()['backup_id']
+
+    exported = client.get(
+        f'/api/sessions/{session_id}/backups/{backup_id}/export',
+        params={"actor_peer_id": "dm", "actor_token": host_token},
+    )
+    assert exported.status_code == 200
+
+    audit = client.get(
+        f'/api/sessions/{session_id}/backups/audit',
+        params={"actor_peer_id": "dm", "actor_token": host_token},
+    )
+    assert audit.status_code == 200
+    actions = [entry['action'] for entry in audit.json()['audit']]
+    assert 'backup_created' in actions
+    assert 'backup_exported' in actions
+
+    responses = [client.post(f'/api/sessions/{session_id}/backup', json={"command": host_command}) for _ in range(6)]
+    assert any(response.status_code == 429 for response in responses)
+
+
+def test_backup_rate_limit_respects_configured_limit(monkeypatch) -> None:
+    monkeypatch.setattr(http_api_module, "get_backup_rate_limit_config", lambda: (2, 60))
+    client = TestClient(app)
+    created = client.post('/api/sessions', json={"session_name": "BackupRateConfig", "host_peer_id": "dm"})
+    session_id = created.json()['session_id']
+    host_token = created.json()['host_peer_token']
+    host_command = {"actor_peer_id": "dm", "actor_token": host_token}
+
+    first = client.post(f'/api/sessions/{session_id}/backup', json={"command": host_command})
+    second = client.post(f'/api/sessions/{session_id}/backup', json={"command": host_command})
+    third = client.post(f'/api/sessions/{session_id}/backup', json={"command": host_command})
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert third.status_code == 429
+
+
 def test_visibility_recompute_enforces_permissions_and_revision_idempotency() -> None:
     client = TestClient(app)
     created = client.post('/api/sessions', json={"session_name": "VisibilitySlice", "host_peer_id": "dm"})
@@ -1378,3 +1575,44 @@ def test_phase4_non_gm_cannot_list_automation_entities() -> None:
     assert macros.status_code == 403
     assert roll_templates.status_code == 403
     assert plugins.status_code == 403
+
+
+def test_phase4_plugin_executor_exceptions_are_isolated() -> None:
+    client = TestClient(app)
+    created = client.post('/api/sessions', json={"session_name": "Phase4PluginExecutorIsolation", "host_peer_id": "dm"})
+    session_id = created.json()['session_id']
+    host_token = created.json()['host_peer_token']
+    host_command = {"actor_peer_id": "dm", "actor_token": host_token}
+
+    registered = client.post(
+        f"/api/sessions/{session_id}/plugins",
+        json={"name": "Hooks", "version": "1.0.0", "capabilities": ["macro:run"], "command": host_command},
+    )
+    assert registered.status_code == 200
+    plugin_id = registered.json()['plugin']['plugin_id']
+
+    def raising_executor(
+        _plugin: dict[str, object],
+        _hook_name: str,
+        _payload: dict[str, object],
+    ) -> dict[str, object]:
+        raise RuntimeError("executor boom")
+
+    previous_executor = getattr(session_service, "plugin_hook_executor", None)
+    session_service.plugin_hook_executor = raising_executor
+    try:
+        hook = client.post(
+            f"/api/sessions/{session_id}/plugins/{plugin_id}/hooks/after_event/execute",
+            json={"payload": {"event_type": "macro_ran"}, "command": host_command},
+        )
+        assert hook.status_code == 200
+        assert hook.json()['status'] == 'isolated_failure'
+        assert hook.json()['error'] == 'plugin hook execution failed'
+    finally:
+        session_service.plugin_hook_executor = previous_executor
+
+    state_still_works = client.get(
+        f"/api/sessions/{session_id}/state",
+        params={"actor_peer_id": "dm", "actor_token": host_token},
+    )
+    assert state_still_works.status_code == 200

@@ -15,7 +15,8 @@ function parseCapabilities(raw: string): { values: string[]; invalid: string[] }
     .map((item) => item.trim())
     .filter(Boolean)
     .filter((item) => {
-      const ok = item.includes(":");
+      const parts = item.split(":", 2);
+      const ok = parts.length === 2 && parts[0].trim().length > 0 && parts[1].trim().length > 0;
       if (!ok) invalid.push(item);
       return ok;
     });
@@ -37,6 +38,7 @@ export function PluginPanel({ plugins, canManage, onRegister, onExecuteHook }: P
   const [executing, setExecuting] = useState(false);
   const [lastHookStatus, setLastHookStatus] = useState("");
   const [validationError, setValidationError] = useState("");
+  const [runtimeError, setRuntimeError] = useState("");
 
   return (
     <div className="panel side-panel">
@@ -62,10 +64,13 @@ export function PluginPanel({ plugins, canManage, onRegister, onExecuteHook }: P
             return;
           }
           setSaving(true);
+          setRuntimeError("");
           try {
             setValidationError("");
             await onRegister(name.trim(), version.trim(), parsed.values);
             setName("");
+          } catch (err) {
+            setRuntimeError(err instanceof Error ? err.message : "Failed to register plugin.");
           } finally {
             setSaving(false);
           }
@@ -97,9 +102,12 @@ export function PluginPanel({ plugins, canManage, onRegister, onExecuteHook }: P
         disabled={!canManage || !selectedPluginId || !hookName || executing}
         onClick={async () => {
           setExecuting(true);
+          setRuntimeError("");
           try {
             const status = await onExecuteHook(selectedPluginId, hookName, { event_type: "manual_trigger", simulate_failure: simulateFailure });
             setLastHookStatus(status);
+          } catch (err) {
+            setRuntimeError(err instanceof Error ? err.message : "Failed to execute plugin hook.");
           } finally {
             setExecuting(false);
           }
@@ -108,6 +116,7 @@ export function PluginPanel({ plugins, canManage, onRegister, onExecuteHook }: P
         {executing ? "Executing..." : "Execute Hook"}
       </button>
       {validationError && <div style={{ marginTop: 8, fontSize: 12, color: "#ff9b9b" }}>{validationError}</div>}
+      {runtimeError && <div style={{ marginTop: 8, fontSize: 12, color: "#ff9b9b" }}>{runtimeError}</div>}
       {lastHookStatus && <div style={{ marginTop: 8, fontSize: 12 }}>Last hook status: {lastHookStatus}</div>}
 
       <ul className="list" style={{ marginTop: 8 }}>

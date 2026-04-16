@@ -38,6 +38,7 @@ export function RollTemplatePanel({ rollTemplates, canManage, onCreate, onRender
   const [variablesInput, setVariablesInput] = useState("actor=Nyx");
   const [renderedOutput, setRenderedOutput] = useState("");
   const [validationError, setValidationError] = useState("");
+  const [runtimeError, setRuntimeError] = useState("");
   const [saving, setSaving] = useState(false);
   const [rendering, setRendering] = useState(false);
 
@@ -73,11 +74,14 @@ export function RollTemplatePanel({ rollTemplates, canManage, onCreate, onRender
             return;
           }
           setSaving(true);
+          setRuntimeError("");
           try {
             setValidationError("");
             await onCreate(name.trim(), template.trim(), parsed.values);
             setName("");
             setTemplate("");
+          } catch (err) {
+            setRuntimeError(err instanceof Error ? err.message : "Failed to create roll template.");
           } finally {
             setSaving(false);
           }
@@ -118,10 +122,13 @@ export function RollTemplatePanel({ rollTemplates, canManage, onCreate, onRender
             return;
           }
           setRendering(true);
+          setRuntimeError("");
           try {
             setValidationError("");
             const output = await onRender(selectedTemplateId, parsed.values);
             setRenderedOutput(output);
+          } catch (err) {
+            setRuntimeError(err instanceof Error ? err.message : "Failed to render roll template.");
           } finally {
             setRendering(false);
           }
@@ -130,6 +137,7 @@ export function RollTemplatePanel({ rollTemplates, canManage, onCreate, onRender
         {rendering ? "Rendering..." : "Render"}
       </button>
       {validationError && <div style={{ marginTop: 8, fontSize: 12, color: "#ff9b9b" }}>{validationError}</div>}
+      {runtimeError && <div style={{ marginTop: 8, fontSize: 12, color: "#ff9b9b" }}>{runtimeError}</div>}
       {renderedOutput && <div style={{ marginTop: 8, fontSize: 12 }}>Rendered: {renderedOutput}</div>}
     </div>
   );

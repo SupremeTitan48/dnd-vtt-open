@@ -220,3 +220,23 @@ class PluginRequest(BaseModel):
 class ExecutePluginHookRequest(BaseModel):
     payload: Dict[str, Any] = Field(default_factory=dict, max_length=32)
     command: Optional[CommandContextRequest] = None
+
+
+class RestoreBackupRequest(BaseModel):
+    backup_id: str = Field(min_length=1)
+    command: Optional[CommandContextRequest] = None
+
+
+class PruneBackupsRequest(BaseModel):
+    keep_latest: int = Field(ge=0, le=500)
+    command: Optional[CommandContextRequest] = None
+
+
+class ImportBackupRequest(BaseModel):
+    backup: Dict[str, Any]
+    checksum_sha256: str = Field(min_length=64, max_length=64)
+    command: Optional[CommandContextRequest] = None
+
+
+class BackupRequest(BaseModel):
+    command: Optional[CommandContextRequest] = None

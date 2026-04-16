@@ -33,16 +33,16 @@ This file tracks practical implementation status against the architecture roadma
   - Visibility cache + perf metrics endpoint (`/health/perf`)
 
 ## Phase 4 - D&D automation/extensibility
-- Status: in progress
+- Status: complete (foundation + closeout hardening)
 - Delivered:
   - Macro subsystem (create/list/run + execution audit trail)
   - Roll template subsystem (create/list/render + action blocks + render audit)
   - Plugin subsystem (register/list + capability metadata + hook execution isolation)
   - Frontend control surfaces for all above (GM/AssistantGM only)
-- Next:
-  - Expand failure/contract tests and stricter capability validation
-  - UX feedback improvements for execution outcomes
-  - Final closeout: short release note and migration notes for API consumers
+- Closed out with:
+  - UI failure feedback for macro/roll/plugin async actions.
+  - Plugin hook isolation enforced at executor boundary (exception-safe isolation).
+  - WS redaction coverage for automation events for non-GM viewers.
 
 ### Phase 4 exit criteria
 - Macro subsystem stable under success/failure and replay scenarios.
@@ -53,7 +53,13 @@ This file tracks practical implementation status against the architecture roadma
 - CI-local verification green (`ruff`, backend tests, frontend tests, frontend build).
 
 ## Phase 5 - Production readiness
-- Status: not started
+- Status: started (initial operational readiness slice)
 - Planned:
   - Durable ops tooling (migrations, backups, observability)
   - Deployment profiles and operational runbooks
+- Delivered so far:
+  - Readiness endpoint (`/health/ready`) with operational checks for session store and event log directories.
+  - Migration compatibility status in readiness (`app/migrations/status.py`; schema bounds + per-session version visibility).
+  - Session backup/restore; list/prune; portable export/import with SHA-256 verification; GM/AssistantGM gates on backup APIs.
+  - Backup audit trail (`/api/sessions/{id}/backups/audit`) and configurable in-memory rate limits (`DND_VTT_BACKUP_RATE_LIMIT_*`).
+  - Self-hosted operations runbook (`docs/operations.md`) including health, backup workflows, rate-limit env vars, and deployment notes.
