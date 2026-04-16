@@ -50,6 +50,16 @@ class StampAssetCommand(BaseModel):
     asset_id: str = Field(min_length=1)
 
 
+class RecomputeVisibilityCommand(BaseModel):
+    token_id: str = Field(min_length=1)
+    radius: int = Field(ge=0)
+
+
+class SetTokenVisionRadiusCommand(BaseModel):
+    token_id: str = Field(min_length=1)
+    radius: int = Field(ge=0)
+
+
 class ImportCharacterCommand(BaseModel):
     import_format: str = Field(min_length=1)
     payload: str = Field(min_length=1)
@@ -73,3 +83,83 @@ class AssignActorOwnerCommand(BaseModel):
 class AssignSessionRoleCommand(BaseModel):
     peer_id: str = Field(min_length=1)
     role: str = Field(min_length=1)
+
+
+class CreateJournalEntryCommand(BaseModel):
+    title: str = Field(min_length=1)
+    content: str = Field(min_length=1)
+
+
+class UpdateJournalEntryCommand(BaseModel):
+    entry_id: str = Field(min_length=1)
+    title: str = Field(min_length=1)
+    content: str = Field(min_length=1)
+
+
+class ShareJournalEntryCommand(BaseModel):
+    entry_id: str = Field(min_length=1)
+    shared_roles: list[str] = Field(default_factory=list)
+    shared_peer_ids: list[str] = Field(default_factory=list)
+    editable_roles: list[str] = Field(default_factory=list)
+    editable_peer_ids: list[str] = Field(default_factory=list)
+
+
+class CreateHandoutCommand(BaseModel):
+    title: str = Field(min_length=1)
+    body: str = Field(min_length=1)
+
+
+class UpdateHandoutCommand(BaseModel):
+    handout_id: str = Field(min_length=1)
+    title: str = Field(min_length=1)
+    body: str = Field(min_length=1)
+
+
+class ShareHandoutCommand(BaseModel):
+    handout_id: str = Field(min_length=1)
+    shared_roles: list[str] = Field(default_factory=list)
+    shared_peer_ids: list[str] = Field(default_factory=list)
+    editable_roles: list[str] = Field(default_factory=list)
+    editable_peer_ids: list[str] = Field(default_factory=list)
+
+
+class AddAssetLibraryItemCommand(BaseModel):
+    asset_id: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    asset_type: str = Field(min_length=1)
+    uri: str = Field(min_length=1)
+    tags: list[str] = Field(default_factory=list)
+    license: str | None = None
+
+
+class CreateMacroCommand(BaseModel):
+    name: str = Field(min_length=1)
+    template: str = Field(min_length=1)
+
+
+class RunMacroCommand(BaseModel):
+    macro_id: str = Field(min_length=1)
+    variables: dict[str, str] = Field(default_factory=dict)
+
+
+class CreateRollTemplateCommand(BaseModel):
+    name: str = Field(min_length=1)
+    template: str = Field(min_length=1)
+    action_blocks: dict[str, str] = Field(default_factory=dict)
+
+
+class RenderRollTemplateCommand(BaseModel):
+    roll_template_id: str = Field(min_length=1)
+    variables: dict[str, str] = Field(default_factory=dict)
+
+
+class RegisterPluginCommand(BaseModel):
+    name: str = Field(min_length=1)
+    version: str = Field(min_length=1)
+    capabilities: list[str] = Field(default_factory=list)
+
+
+class ExecutePluginHookCommand(BaseModel):
+    plugin_id: str = Field(min_length=1)
+    hook_name: str = Field(min_length=1)
+    payload: dict[str, object] = Field(default_factory=dict)

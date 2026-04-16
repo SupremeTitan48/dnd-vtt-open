@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import secrets
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -28,6 +29,7 @@ class SessionPermissionError(PermissionDeniedError):
 @dataclass
 class CommandContext:
     actor_peer_id: str | None = None
+    actor_token: str | None = None
     actor_role: str | None = None
     expected_revision: int | None = None
     idempotency_key: str | None = None
@@ -38,6 +40,7 @@ class SessionService:
     store: SessionStore = field(default_factory=lambda: SessionStore(Path('.sessions')))
     sessions: dict[str, dict[str, Any]] = field(default_factory=dict)
     engines: dict[str, GameStateEngine] = field(default_factory=dict)
+    campaigns: dict[str, dict[str, Any]] = field(default_factory=dict)
     allowed_roles: set[str] = field(default_factory=lambda: {'GM', 'AssistantGM', 'Player', 'Observer'})
 
     def _ensure_metadata(self, session_id: str) -> None:
@@ -46,11 +49,44 @@ class SessionService:
             session.setdefault('characters', [])
             session.setdefault('notes', '')
             session.setdefault('encounter_templates', [])
+            session.setdefault('campaign_id', session_id)
             session.setdefault('revision', 0)
             session.setdefault('peer_roles', {session.get('host_peer_id', 'host'): 'GM'})
             session.setdefault('idempotency_results', {})
             session.setdefault('actor_owners', {})
             session.setdefault('peer_tokens', {session.get('host_peer_id', 'host'): secrets.token_urlsafe(24)})
+            self._ensure_campaign(session['campaign_id'])
+
+    def _default_encounter_templates(self) -> list[dict[str, str]]:
+        return [
+            {'template_name': 'Ambush', 'description': 'Fast 3-enemy opener with cover'},
+            {'template_name': 'Social Pivot', 'description': 'Negotiation scene that can turn into combat'},
+        ]
+
+    def _ensure_campaign(self, campaign_id: str) -> None:
+        if campaign_id not in self.campaigns:
+            self.campaigns[campaign_id] = {
+                'campaign_id': campaign_id,
+                'encounter_templates': self._default_encounter_templates(),
+                'journal_entries': [],
+                'handouts': [],
+                'asset_library': [],
+                'macros': [],
+                'macro_executions': [],
+                'roll_templates': [],
+                'roll_template_renders': [],
+                'plugins': [],
+                'plugin_hook_executions': [],
+            }
+
+    def _campaign_for_session(self, session_id: str) -> dict[str, Any]:
+        session = self.sessions.get(session_id)
+        if not session:
+            raise SessionPermissionError('Session not found')
+        self._ensure_metadata(session_id)
+        campaign_id = str(session.get('campaign_id', session_id))
+        self._ensure_campaign(campaign_id)
+        return self.campaigns[campaign_id]
 
     def _normalize_command(self, command: CommandContext | None) -> CommandContext:
         return command or CommandContext()
@@ -149,6 +185,45 @@ class SessionService:
         role = self._resolve_role(session, normalized)
         return can_access_resource(role, 'actor', 'read', is_owner=self._is_actor_owner(session, actor_id, command))
 
+    def _owned_actor_ids_for_command(self, session: dict[str, Any], command: CommandContext | None) -> set[str]:
+        normalized = self._normalize_command(command)
+        actor_peer_id = normalized.actor_peer_id
+        if actor_peer_id is None:
+            return set()
+        return {
+            actor_id
+            for actor_id, owners in session.get('actor_owners', {}).items()
+            if actor_peer_id in owners
+        }
+
+    def _can_view_content_item(self, session: dict[str, Any], item: dict[str, Any], command: CommandContext | None) -> bool:
+        normalized = self._normalize_command(command)
+        role = self._resolve_role(session, normalized)
+        if can_view_gm_secrets(role):
+            return True
+        actor_peer_id = normalized.actor_peer_id
+        shared_roles = set(item.get('shared_roles', []))
+        shared_peer_ids = set(item.get('shared_peer_ids', []))
+        if role in shared_roles:
+            return True
+        if actor_peer_id and actor_peer_id in shared_peer_ids:
+            return True
+        return False
+
+    def _can_edit_content_item(self, session: dict[str, Any], item: dict[str, Any], command: CommandContext | None) -> bool:
+        normalized = self._normalize_command(command)
+        role = self._resolve_role(session, normalized)
+        if can_view_gm_secrets(role):
+            return True
+        actor_peer_id = normalized.actor_peer_id
+        editable_roles = set(item.get('editable_roles', []))
+        editable_peer_ids = set(item.get('editable_peer_ids', []))
+        if role in editable_roles:
+            return True
+        if actor_peer_id and actor_peer_id in editable_peer_ids:
+            return True
+        return False
+
     def _event_actor_id(self, event: dict[str, Any]) -> str | None:
         payload = event.get('payload', {})
         if not isinstance(payload, dict):
@@ -186,7 +261,21 @@ class SessionService:
             filtered['payload'] = {}
             return filtered
 
-        if event_type in {'session_role_assigned', 'actor_owner_assigned'}:
+        if event_type in {'vision_updated', 'token_vision_updated'}:
+            token_id = payload.get('token_id')
+            if isinstance(token_id, str) and token_id not in self._owned_actor_ids_for_command(session, command):
+                filtered['payload'] = {}
+                return filtered
+
+        if event_type in {'session_role_assigned', 'actor_owner_assigned', 'journal_entry_shared', 'handout_shared'}:
+            filtered['payload'] = {}
+        if event_type in {'macro_created', 'macro_ran'} and not self._can_view_gm_secrets(session, command):
+            filtered['payload'] = {}
+        if event_type in {'roll_template_created', 'roll_template_rendered'} and not self._can_view_gm_secrets(session, command):
+            filtered['payload'] = {}
+        if event_type in {'plugin_registered', 'plugin_hook_succeeded', 'plugin_hook_failed'} and not self._can_view_gm_secrets(
+            session, command
+        ):
             filtered['payload'] = {}
         return filtered
 
@@ -210,6 +299,8 @@ class SessionService:
         filtered = filtered.copy()
         filtered['notes'] = ''
         filtered['encounter_templates'] = []
+        filtered['journal_entries'] = []
+        filtered['handouts'] = []
         filtered.pop('peer_roles', None)
         filtered.pop('actor_owners', None)
         return filtered
@@ -218,43 +309,52 @@ class SessionService:
         session = self.sessions.get(session_id)
         if not session or self._can_view_gm_secrets(session, command):
             return state
-        normalized = self._normalize_command(command)
         filtered = copy.deepcopy(state)
         filtered_map = filtered.get('map', {})
         filtered_map['blocked_cells'] = []
-        actor_id = normalized.actor_peer_id
-        owned_actors = {
-            actor
-            for actor, owners in session.get('actor_owners', {}).items()
-            if actor_id is not None and actor_id in owners
-        }
+        owned_actors = self._owned_actor_ids_for_command(session, command)
         filtered['actors'] = {
             actor_key: actor_value
             for actor_key, actor_value in filtered.get('actors', {}).items()
             if actor_key in owned_actors
         }
+        visibility_by_token = filtered_map.get('visibility_cells_by_token')
+        if isinstance(visibility_by_token, dict):
+            filtered_map['visibility_cells_by_token'] = {
+                token_id: cells
+                for token_id, cells in visibility_by_token.items()
+                if token_id in owned_actors
+            }
+        radius_by_token = filtered_map.get('vision_radius_by_token')
+        if isinstance(radius_by_token, dict):
+            filtered_map['vision_radius_by_token'] = {
+                token_id: radius
+                for token_id, radius in radius_by_token.items()
+                if token_id in owned_actors
+            }
         return filtered
 
     def create_session(
         self,
         session_name: str,
         host_peer_id: str,
+        campaign_id: str | None = None,
         map_width: int = 30,
         map_height: int = 20,
     ) -> dict[str, Any]:
         session_id = secrets.token_hex(4)
+        resolved_campaign_id = campaign_id or session_id
+        self._ensure_campaign(resolved_campaign_id)
         self.sessions[session_id] = {
             'session_id': session_id,
             'session_name': session_name,
             'host_peer_id': host_peer_id,
+            'campaign_id': resolved_campaign_id,
             'peers': [host_peer_id],
             'created_at': datetime.now(timezone.utc).isoformat(),
             'characters': [],
             'notes': '',
-            'encounter_templates': [
-                {'template_name': 'Ambush', 'description': 'Fast 3-enemy opener with cover'},
-                {'template_name': 'Social Pivot', 'description': 'Negotiation scene that can turn into combat'},
-            ],
+            'encounter_templates': [],
             'revision': 0,
             'peer_roles': {host_peer_id: 'GM'},
             'idempotency_results': {},
@@ -272,7 +372,14 @@ class SessionService:
             self._ensure_metadata(session_id)
             if not self._is_known_peer(session, command):
                 return None
-            return self._filter_session_for_view(session, command)
+            result = self._filter_session_for_view(session, command)
+            campaign = self._campaign_for_session(session_id)
+            if self._can_view_gm_secrets(session, command):
+                result['encounter_templates'] = campaign.get('encounter_templates', [])
+            result['journal_entries'] = self.get_journal_entries(session_id, command=command) or []
+            result['handouts'] = self.get_handouts(session_id, command=command) or []
+            result['asset_library'] = self.get_asset_library(session_id, command=command) or []
+            return result
         return None
 
     def join_session(self, session_id: str, peer_id: str) -> dict[str, Any] | None:
@@ -436,6 +543,36 @@ class SessionService:
         self._cache_result(session_id, command, result)
         return result
 
+    def recompute_visibility(
+        self, session_id: str, token_id: str, radius: int, command: CommandContext | None = None
+    ) -> dict[str, Any] | None:
+        engine = self.get_engine(session_id)
+        if not engine:
+            return None
+        cached = self._prepare_mutation(session_id, command, resource='map')
+        if cached is not None:
+            return cached
+        engine.compute_visible_cells(token_id, radius)
+        self._increment_revision(session_id)
+        result = self._state_with_revision(session_id)
+        self._cache_result(session_id, command, result)
+        return result
+
+    def set_token_vision_radius(
+        self, session_id: str, token_id: str, radius: int, command: CommandContext | None = None
+    ) -> dict[str, Any] | None:
+        engine = self.get_engine(session_id)
+        if not engine:
+            return None
+        cached = self._prepare_mutation(session_id, command, resource='map')
+        if cached is not None:
+            return cached
+        engine.set_token_vision_radius(token_id, radius)
+        self._increment_revision(session_id)
+        result = self._state_with_revision(session_id)
+        self._cache_result(session_id, command, result)
+        return result
+
     def import_character(
         self,
         session_id: str,
@@ -531,11 +668,12 @@ class SessionService:
         if cached is not None:
             return cached
         self._ensure_metadata(session_id)
-        session['encounter_templates'].append({'template_name': template_name, 'description': description})
+        campaign = self._campaign_for_session(session_id)
+        campaign['encounter_templates'].append({'template_name': template_name, 'description': description})
         self._increment_revision(session_id)
         result = {
             'session_id': session_id,
-            'encounter_templates': session['encounter_templates'],
+            'encounter_templates': campaign['encounter_templates'],
             'revision': self._current_revision(session_id),
         }
         self._cache_result(session_id, command, result)
@@ -550,7 +688,490 @@ class SessionService:
             return None
         if not self._can_view_gm_secrets(session, command):
             return {'session_id': session_id, 'encounter_templates': []}
-        return {'session_id': session_id, 'encounter_templates': session['encounter_templates']}
+        campaign = self._campaign_for_session(session_id)
+        return {'session_id': session_id, 'encounter_templates': campaign['encounter_templates']}
+
+    def create_journal_entry(
+        self, session_id: str, title: str, content: str, command: CommandContext | None = None
+    ) -> dict[str, Any] | None:
+        session = self.sessions.get(session_id)
+        if not session:
+            return None
+        cached = self._prepare_mutation(session_id, command, resource='journal')
+        if cached is not None:
+            return cached
+        campaign = self._campaign_for_session(session_id)
+        entry = {
+            'entry_id': secrets.token_hex(6),
+            'title': title,
+            'content': content,
+            'shared_roles': [],
+            'shared_peer_ids': [],
+            'editable_roles': [],
+            'editable_peer_ids': [],
+            'created_at': datetime.now(timezone.utc).isoformat(),
+            'updated_at': datetime.now(timezone.utc).isoformat(),
+        }
+        campaign['journal_entries'].append(entry)
+        self._increment_revision(session_id)
+        result = {'session_id': session_id, 'entry': entry, 'revision': self._current_revision(session_id)}
+        self._cache_result(session_id, command, result)
+        return result
+
+    def update_journal_entry(
+        self, session_id: str, entry_id: str, title: str, content: str, command: CommandContext | None = None
+    ) -> dict[str, Any] | None:
+        session = self.sessions.get(session_id)
+        if not session:
+            return None
+        cached = self._prepare_mutation(session_id, command, resource='journal')
+        if cached is not None:
+            return cached
+        campaign = self._campaign_for_session(session_id)
+        entry = next((item for item in campaign['journal_entries'] if item['entry_id'] == entry_id), None)
+        if entry is None:
+            raise SessionPermissionError('Journal entry not found')
+        if not self._can_edit_content_item(session, entry, command):
+            raise SessionPermissionError('Journal entry edit not allowed')
+        entry['title'] = title
+        entry['content'] = content
+        entry['updated_at'] = datetime.now(timezone.utc).isoformat()
+        self._increment_revision(session_id)
+        result = {'session_id': session_id, 'entry': entry, 'revision': self._current_revision(session_id)}
+        self._cache_result(session_id, command, result)
+        return result
+
+    def share_journal_entry(
+        self,
+        session_id: str,
+        entry_id: str,
+        *,
+        shared_roles: list[str],
+        shared_peer_ids: list[str],
+        editable_roles: list[str],
+        editable_peer_ids: list[str],
+        command: CommandContext | None = None,
+    ) -> dict[str, Any] | None:
+        session = self.sessions.get(session_id)
+        if not session:
+            return None
+        cached = self._prepare_mutation(session_id, command, resource='journal', action='share')
+        if cached is not None:
+            return cached
+        campaign = self._campaign_for_session(session_id)
+        entry = next((item for item in campaign['journal_entries'] if item['entry_id'] == entry_id), None)
+        if entry is None:
+            raise SessionPermissionError('Journal entry not found')
+        entry['shared_roles'] = [role for role in shared_roles if role in self.allowed_roles]
+        entry['shared_peer_ids'] = [peer_id for peer_id in shared_peer_ids if peer_id in session.get('peers', [])]
+        entry['editable_roles'] = [role for role in editable_roles if role in self.allowed_roles]
+        entry['editable_peer_ids'] = [peer_id for peer_id in editable_peer_ids if peer_id in session.get('peers', [])]
+        entry['updated_at'] = datetime.now(timezone.utc).isoformat()
+        self._increment_revision(session_id)
+        result = {'session_id': session_id, 'entry': entry, 'revision': self._current_revision(session_id)}
+        self._cache_result(session_id, command, result)
+        return result
+
+    def get_journal_entries(self, session_id: str, command: CommandContext | None = None) -> list[dict[str, Any]] | None:
+        session = self.sessions.get(session_id)
+        if not session:
+            return None
+        self._ensure_metadata(session_id)
+        campaign = self._campaign_for_session(session_id)
+        visible: list[dict[str, Any]] = []
+        for entry in campaign['journal_entries']:
+            if self._can_view_content_item(session, entry, command):
+                visible.append(entry)
+        return visible
+
+    def create_handout(self, session_id: str, title: str, body: str, command: CommandContext | None = None) -> dict[str, Any] | None:
+        session = self.sessions.get(session_id)
+        if not session:
+            return None
+        cached = self._prepare_mutation(session_id, command, resource='handout')
+        if cached is not None:
+            return cached
+        campaign = self._campaign_for_session(session_id)
+        handout = {
+            'handout_id': secrets.token_hex(6),
+            'title': title,
+            'body': body,
+            'shared_roles': [],
+            'shared_peer_ids': [],
+            'editable_roles': [],
+            'editable_peer_ids': [],
+            'created_at': datetime.now(timezone.utc).isoformat(),
+            'updated_at': datetime.now(timezone.utc).isoformat(),
+        }
+        campaign['handouts'].append(handout)
+        self._increment_revision(session_id)
+        result = {'session_id': session_id, 'handout': handout, 'revision': self._current_revision(session_id)}
+        self._cache_result(session_id, command, result)
+        return result
+
+    def update_handout(
+        self, session_id: str, handout_id: str, title: str, body: str, command: CommandContext | None = None
+    ) -> dict[str, Any] | None:
+        session = self.sessions.get(session_id)
+        if not session:
+            return None
+        cached = self._prepare_mutation(session_id, command, resource='handout')
+        if cached is not None:
+            return cached
+        campaign = self._campaign_for_session(session_id)
+        handout = next((item for item in campaign['handouts'] if item['handout_id'] == handout_id), None)
+        if handout is None:
+            raise SessionPermissionError('Handout not found')
+        if not self._can_edit_content_item(session, handout, command):
+            raise SessionPermissionError('Handout edit not allowed')
+        handout['title'] = title
+        handout['body'] = body
+        handout['updated_at'] = datetime.now(timezone.utc).isoformat()
+        self._increment_revision(session_id)
+        result = {'session_id': session_id, 'handout': handout, 'revision': self._current_revision(session_id)}
+        self._cache_result(session_id, command, result)
+        return result
+
+    def share_handout(
+        self,
+        session_id: str,
+        handout_id: str,
+        *,
+        shared_roles: list[str],
+        shared_peer_ids: list[str],
+        editable_roles: list[str],
+        editable_peer_ids: list[str],
+        command: CommandContext | None = None,
+    ) -> dict[str, Any] | None:
+        session = self.sessions.get(session_id)
+        if not session:
+            return None
+        cached = self._prepare_mutation(session_id, command, resource='handout', action='share')
+        if cached is not None:
+            return cached
+        campaign = self._campaign_for_session(session_id)
+        handout = next((item for item in campaign['handouts'] if item['handout_id'] == handout_id), None)
+        if handout is None:
+            raise SessionPermissionError('Handout not found')
+        handout['shared_roles'] = [role for role in shared_roles if role in self.allowed_roles]
+        handout['shared_peer_ids'] = [peer_id for peer_id in shared_peer_ids if peer_id in session.get('peers', [])]
+        handout['editable_roles'] = [role for role in editable_roles if role in self.allowed_roles]
+        handout['editable_peer_ids'] = [peer_id for peer_id in editable_peer_ids if peer_id in session.get('peers', [])]
+        handout['updated_at'] = datetime.now(timezone.utc).isoformat()
+        self._increment_revision(session_id)
+        result = {'session_id': session_id, 'handout': handout, 'revision': self._current_revision(session_id)}
+        self._cache_result(session_id, command, result)
+        return result
+
+    def get_handouts(self, session_id: str, command: CommandContext | None = None) -> list[dict[str, Any]] | None:
+        session = self.sessions.get(session_id)
+        if not session:
+            return None
+        self._ensure_metadata(session_id)
+        campaign = self._campaign_for_session(session_id)
+        visible: list[dict[str, Any]] = []
+        for handout in campaign['handouts']:
+            if self._can_view_content_item(session, handout, command):
+                visible.append(handout)
+        return visible
+
+    def add_asset_library_item(
+        self,
+        session_id: str,
+        asset_id: str,
+        name: str,
+        asset_type: str,
+        uri: str,
+        tags: list[str],
+        license: str | None,
+        command: CommandContext | None = None,
+    ) -> dict[str, Any] | None:
+        session = self.sessions.get(session_id)
+        if not session:
+            return None
+        cached = self._prepare_mutation(session_id, command, resource='asset_library')
+        if cached is not None:
+            return cached
+        campaign = self._campaign_for_session(session_id)
+        existing = next((item for item in campaign['asset_library'] if item['asset_id'] == asset_id), None)
+        if existing is not None:
+            existing.update({'name': name, 'asset_type': asset_type, 'uri': uri, 'tags': tags, 'license': license})
+            asset_item = existing
+        else:
+            asset_item = {
+                'asset_id': asset_id,
+                'name': name,
+                'asset_type': asset_type,
+                'uri': uri,
+                'tags': tags,
+                'license': license,
+                'created_at': datetime.now(timezone.utc).isoformat(),
+            }
+            campaign['asset_library'].append(asset_item)
+        self._increment_revision(session_id)
+        result = {'session_id': session_id, 'asset': asset_item, 'revision': self._current_revision(session_id)}
+        self._cache_result(session_id, command, result)
+        return result
+
+    def get_asset_library(self, session_id: str, command: CommandContext | None = None) -> list[dict[str, Any]] | None:
+        session = self.sessions.get(session_id)
+        if not session:
+            return None
+        self._ensure_metadata(session_id)
+        if not self._is_known_peer(session, command):
+            return None
+        campaign = self._campaign_for_session(session_id)
+        return campaign['asset_library']
+
+    def create_macro(self, session_id: str, name: str, template: str, command: CommandContext | None = None) -> dict[str, Any] | None:
+        session = self.sessions.get(session_id)
+        if not session:
+            return None
+        cached = self._prepare_mutation(session_id, command, resource='macro')
+        if cached is not None:
+            return cached
+        campaign = self._campaign_for_session(session_id)
+        macro = {
+            'macro_id': secrets.token_hex(6),
+            'name': name,
+            'template': template,
+            'created_at': datetime.now(timezone.utc).isoformat(),
+            'updated_at': datetime.now(timezone.utc).isoformat(),
+        }
+        campaign['macros'].append(macro)
+        self._increment_revision(session_id)
+        result = {'session_id': session_id, 'macro': macro, 'revision': self._current_revision(session_id)}
+        self._cache_result(session_id, command, result)
+        return result
+
+    def get_macros(self, session_id: str, command: CommandContext | None = None) -> list[dict[str, Any]] | None:
+        session = self.sessions.get(session_id)
+        if not session:
+            return None
+        self._ensure_metadata(session_id)
+        normalized = self._normalize_command(command)
+        role = self._resolve_role(session, normalized)
+        if not can_access_resource(role, 'macro', 'read'):
+            raise SessionPermissionError('Permission denied for macro:read')
+        campaign = self._campaign_for_session(session_id)
+        return campaign['macros']
+
+    def run_macro(
+        self,
+        session_id: str,
+        macro_id: str,
+        variables: dict[str, str],
+        command: CommandContext | None = None,
+    ) -> dict[str, Any] | None:
+        session = self.sessions.get(session_id)
+        if not session:
+            return None
+        cached = self._prepare_mutation(session_id, command, resource='macro')
+        if cached is not None:
+            return cached
+        campaign = self._campaign_for_session(session_id)
+        macro = next((item for item in campaign['macros'] if item['macro_id'] == macro_id), None)
+        if macro is None:
+            raise SessionPermissionError('Macro not found')
+        try:
+            rendered = str(macro['template']).format_map(variables)
+        except KeyError as exc:
+            raise SessionPermissionError('Macro render failed due to missing required variables') from exc
+        execution = {
+            'execution_id': secrets.token_hex(8),
+            'macro_id': macro_id,
+            'result': rendered,
+            'variables': variables,
+            'actor_peer_id': self._normalize_command(command).actor_peer_id,
+            'executed_at': datetime.now(timezone.utc).isoformat(),
+        }
+        campaign['macro_executions'].append(execution)
+        macro['updated_at'] = datetime.now(timezone.utc).isoformat()
+        self._increment_revision(session_id)
+        result = {
+            'session_id': session_id,
+            'macro_id': macro_id,
+            'result': rendered,
+            'execution': execution,
+            'revision': self._current_revision(session_id),
+        }
+        self._cache_result(session_id, command, result)
+        return result
+
+    def create_roll_template(
+        self,
+        session_id: str,
+        name: str,
+        template: str,
+        action_blocks: dict[str, str],
+        command: CommandContext | None = None,
+    ) -> dict[str, Any] | None:
+        session = self.sessions.get(session_id)
+        if not session:
+            return None
+        cached = self._prepare_mutation(session_id, command, resource='roll_template')
+        if cached is not None:
+            return cached
+        campaign = self._campaign_for_session(session_id)
+        roll_template = {
+            'roll_template_id': secrets.token_hex(6),
+            'name': name,
+            'template': template,
+            'action_blocks': action_blocks,
+            'created_at': datetime.now(timezone.utc).isoformat(),
+            'updated_at': datetime.now(timezone.utc).isoformat(),
+        }
+        campaign['roll_templates'].append(roll_template)
+        self._increment_revision(session_id)
+        result = {'session_id': session_id, 'roll_template': roll_template, 'revision': self._current_revision(session_id)}
+        self._cache_result(session_id, command, result)
+        return result
+
+    def get_roll_templates(self, session_id: str, command: CommandContext | None = None) -> list[dict[str, Any]] | None:
+        session = self.sessions.get(session_id)
+        if not session:
+            return None
+        self._ensure_metadata(session_id)
+        normalized = self._normalize_command(command)
+        role = self._resolve_role(session, normalized)
+        if not can_access_resource(role, 'roll_template', 'read'):
+            raise SessionPermissionError('Permission denied for roll_template:read')
+        campaign = self._campaign_for_session(session_id)
+        return campaign['roll_templates']
+
+    def render_roll_template(
+        self,
+        session_id: str,
+        roll_template_id: str,
+        variables: dict[str, str],
+        command: CommandContext | None = None,
+    ) -> dict[str, Any] | None:
+        session = self.sessions.get(session_id)
+        if not session:
+            return None
+        cached = self._prepare_mutation(session_id, command, resource='roll_template')
+        if cached is not None:
+            return cached
+        campaign = self._campaign_for_session(session_id)
+        roll_template = next((item for item in campaign['roll_templates'] if item['roll_template_id'] == roll_template_id), None)
+        if roll_template is None:
+            raise SessionPermissionError('Roll template not found')
+        merged_variables = dict(roll_template.get('action_blocks', {}))
+        merged_variables.update(variables)
+        try:
+            rendered = str(roll_template['template']).format_map(merged_variables)
+        except KeyError as exc:
+            raise SessionPermissionError('Roll template render failed due to missing required variables') from exc
+        render_entry = {
+            'render_id': secrets.token_hex(8),
+            'roll_template_id': roll_template_id,
+            'rendered': rendered,
+            'variables': merged_variables,
+            'actor_peer_id': self._normalize_command(command).actor_peer_id,
+            'rendered_at': datetime.now(timezone.utc).isoformat(),
+        }
+        campaign['roll_template_renders'].append(render_entry)
+        roll_template['updated_at'] = datetime.now(timezone.utc).isoformat()
+        self._increment_revision(session_id)
+        result = {
+            'session_id': session_id,
+            'roll_template_id': roll_template_id,
+            'rendered': rendered,
+            'render': render_entry,
+            'revision': self._current_revision(session_id),
+        }
+        self._cache_result(session_id, command, result)
+        return result
+
+    def register_plugin(
+        self,
+        session_id: str,
+        name: str,
+        version: str,
+        capabilities: list[str],
+        command: CommandContext | None = None,
+    ) -> dict[str, Any] | None:
+        session = self.sessions.get(session_id)
+        if not session:
+            return None
+        cached = self._prepare_mutation(session_id, command, resource='plugin')
+        if cached is not None:
+            return cached
+        campaign = self._campaign_for_session(session_id)
+        plugin = {
+            'plugin_id': secrets.token_hex(6),
+            'name': name,
+            'version': version,
+            'capabilities': capabilities,
+            'created_at': datetime.now(timezone.utc).isoformat(),
+        }
+        campaign['plugins'].append(plugin)
+        self._increment_revision(session_id)
+        result = {'session_id': session_id, 'plugin': plugin, 'revision': self._current_revision(session_id)}
+        self._cache_result(session_id, command, result)
+        return result
+
+    def get_plugins(self, session_id: str, command: CommandContext | None = None) -> list[dict[str, Any]] | None:
+        session = self.sessions.get(session_id)
+        if not session:
+            return None
+        self._ensure_metadata(session_id)
+        normalized = self._normalize_command(command)
+        role = self._resolve_role(session, normalized)
+        if not can_access_resource(role, 'plugin', 'read'):
+            raise SessionPermissionError('Permission denied for plugin:read')
+        campaign = self._campaign_for_session(session_id)
+        return campaign['plugins']
+
+    def execute_plugin_hook(
+        self,
+        session_id: str,
+        plugin_id: str,
+        hook_name: str,
+        payload: dict[str, Any],
+        command: CommandContext | None = None,
+    ) -> dict[str, Any] | None:
+        session = self.sessions.get(session_id)
+        if not session:
+            return None
+        cached = self._prepare_mutation(session_id, command, resource='plugin')
+        if cached is not None:
+            return cached
+        campaign = self._campaign_for_session(session_id)
+        plugin = next((item for item in campaign['plugins'] if item['plugin_id'] == plugin_id), None)
+        if plugin is None:
+            raise SessionPermissionError('Plugin not found')
+
+        execution = {
+            'execution_id': secrets.token_hex(8),
+            'plugin_id': plugin_id,
+            'hook_name': hook_name,
+            'actor_peer_id': self._normalize_command(command).actor_peer_id,
+            'executed_at': datetime.now(timezone.utc).isoformat(),
+            'payload': payload,
+        }
+        campaign['plugin_hook_executions'].append(execution)
+        self._increment_revision(session_id)
+
+        if payload.get('simulate_failure'):
+            return {
+                'session_id': session_id,
+                'plugin_id': plugin_id,
+                'hook_name': hook_name,
+                'status': 'isolated_failure',
+                'error': 'simulated plugin hook failure',
+                'execution': execution,
+                'revision': self._current_revision(session_id),
+            }
+
+        return {
+            'session_id': session_id,
+            'plugin_id': plugin_id,
+            'hook_name': hook_name,
+            'status': 'ok',
+            'execution': execution,
+            'revision': self._current_revision(session_id),
+        }
 
     def get_state(self, session_id: str, command: CommandContext | None = None) -> dict[str, Any] | None:
         engine = self.get_engine(session_id)
@@ -611,18 +1232,45 @@ class SessionService:
         engine = self.get_engine(session_id)
         if not engine:
             return None
-        return self.store.save(session_id, engine)
+        self._ensure_metadata(session_id)
+        session = self.sessions.get(session_id)
+        if session is None:
+            return None
+        campaign = self._campaign_for_session(session_id)
+        path = self.store.save(session_id, engine)
+        metadata_path = self.store.base_dir / f'{session_id}.meta.json'
+        metadata_path.write_text(
+            json.dumps(
+                {
+                    'session': session,
+                    'campaign': campaign,
+                },
+                indent=2,
+            )
+        )
+        return path
 
     def load(self, session_id: str) -> dict[str, Any] | None:
         if not (self.store.base_dir / f'{session_id}.json').exists():
             return None
         engine = self.store.load(session_id)
         self.engines[session_id] = engine
+        metadata_path = self.store.base_dir / f'{session_id}.meta.json'
+        if metadata_path.exists():
+            metadata = json.loads(metadata_path.read_text())
+            session = metadata.get('session') if isinstance(metadata, dict) else None
+            campaign = metadata.get('campaign') if isinstance(metadata, dict) else None
+            if isinstance(session, dict):
+                self.sessions[session_id] = session
+            if isinstance(campaign, dict):
+                campaign_id = str(campaign.get('campaign_id') or self.sessions.get(session_id, {}).get('campaign_id') or session_id)
+                self.campaigns[campaign_id] = campaign
         if session_id not in self.sessions:
             self.sessions[session_id] = {
                 'session_id': session_id,
                 'session_name': session_id.replace('-', ' ').title(),
                 'host_peer_id': 'loaded-host',
+                'campaign_id': session_id,
                 'peers': ['loaded-host'],
                 'created_at': datetime.now(timezone.utc).isoformat(),
                 'characters': [],
@@ -636,8 +1284,33 @@ class SessionService:
             }
         else:
             self._ensure_metadata(session_id)
+        self._ensure_campaign(str(self.sessions[session_id].get('campaign_id', session_id)))
         return engine.snapshot()
 
     def get_tutorial(self, tutorial_path: str = 'packs/starter/tutorials/dm_tutorial_map.json') -> dict[str, Any]:
         tutorial = load_tutorial(tutorial_path)
         return tutorial.model_dump()
+
+    def get_visibility_perf_metrics(self) -> dict[str, Any]:
+        total_hits = 0
+        total_misses = 0
+        sessions: list[dict[str, Any]] = []
+        for session_id, engine in self.engines.items():
+            hits = engine.map_state.visibility_cache_hits
+            misses = engine.map_state.visibility_cache_misses
+            total_hits += hits
+            total_misses += misses
+            sessions.append(
+                {
+                    'session_id': session_id,
+                    'visibility_cache_hits': hits,
+                    'visibility_cache_misses': misses,
+                    'blocker_revision': engine.map_state.blocker_revision,
+                }
+            )
+        return {
+            'active_sessions': len(self.sessions),
+            'visibility_cache_hits': total_hits,
+            'visibility_cache_misses': total_misses,
+            'sessions': sessions,
+        }

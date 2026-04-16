@@ -9,6 +9,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Query, WebSocket, WebSocketDisconnect
 
 from api.schemas import (
+    AssetLibraryItemRequest,
     ActorOwnershipRequest,
     ActorStateRequest,
     CharacterImportRequest,
@@ -20,14 +21,27 @@ from api.schemas import (
     MoveTokenRequest,
     NextTurnRequest,
     PaintTerrainRequest,
+    PluginRequest,
+    MacroRequest,
+    RollTemplateRequest,
     RelayTicketRequest,
+    RecomputeVisibilityRequest,
+    TokenVisionRequest,
     RevealCellRequest,
+    ShareRequest,
     SessionCreateRequest,
+    JournalEntryRequest,
+    JournalEntryUpdateRequest,
+    HandoutRequest,
+    HandoutUpdateRequest,
     SessionRoleRequest,
     SessionNotesRequest,
     SignalMessage,
     StampAssetRequest,
     ToggleBlockedRequest,
+    RunMacroRequest,
+    RenderRollTemplateRequest,
+    ExecutePluginHookRequest,
 )
 from app.commands.dispatcher import CommandDispatcher, InvalidCommandPayloadError, UnknownCommandError
 from app.events.file_event_log import JsonlEventLogSink
@@ -48,6 +62,7 @@ def _to_command_context(command: CommandContextRequest | None) -> CommandContext
         return CommandContext()
     return CommandContext(
         actor_peer_id=command.actor_peer_id,
+        actor_token=command.actor_token,
         actor_role=command.actor_role,
         expected_revision=command.expected_revision,
         idempotency_key=command.idempotency_key,
@@ -107,11 +122,26 @@ def _validate_read_identity(session_id: str, actor_peer_id: str | None, actor_to
         raise HTTPException(status_code=403, detail='invalid actor token')
 
 
+def _require_read_identity(session_id: str, actor_peer_id: str | None, actor_token: str | None) -> None:
+    if not actor_peer_id:
+        raise HTTPException(status_code=403, detail='actor_peer_id is required')
+    if not session_service.validate_peer_token(session_id, actor_peer_id, actor_token):
+        raise HTTPException(status_code=403, detail='invalid actor token')
+
+
+def _require_command_identity(session_id: str, command: CommandContextRequest | None) -> None:
+    if command is None or not command.actor_peer_id:
+        raise HTTPException(status_code=403, detail='command.actor_peer_id is required')
+    if not session_service.validate_peer_token(session_id, command.actor_peer_id, command.actor_token):
+        raise HTTPException(status_code=403, detail='invalid actor token')
+
+
 @router.post('/sessions')
 def create_session(request: SessionCreateRequest) -> dict:
     return session_service.create_session(
         session_name=request.session_name,
         host_peer_id=request.host_peer_id,
+        campaign_id=request.campaign_id,
         map_width=request.map_width,
         map_height=request.map_height,
     )
@@ -340,6 +370,44 @@ async def stamp_asset(session_id: str, request: StampAssetRequest) -> dict:
     return {'session_id': session_id, 'state': state}
 
 
+@router.post('/sessions/{session_id}/recompute-visibility')
+async def recompute_visibility(session_id: str, request: RecomputeVisibilityRequest) -> dict:
+    replay = _is_idempotency_replay(session_id, request.command)
+    state = _dispatch_command(
+        session_id,
+        'recompute_visibility',
+        {'token_id': request.token_id, 'radius': request.radius},
+        request.command,
+    )
+    if not replay:
+        await _publish_session_event(
+            session_id,
+            'vision_updated',
+            {'token_id': request.token_id, 'radius': request.radius},
+            revision=state.get('revision'),
+        )
+    return {'session_id': session_id, 'state': state}
+
+
+@router.post('/sessions/{session_id}/token-vision')
+async def set_token_vision(session_id: str, request: TokenVisionRequest) -> dict:
+    replay = _is_idempotency_replay(session_id, request.command)
+    state = _dispatch_command(
+        session_id,
+        'set_token_vision_radius',
+        {'token_id': request.token_id, 'radius': request.radius},
+        request.command,
+    )
+    if not replay:
+        await _publish_session_event(
+            session_id,
+            'token_vision_updated',
+            {'token_id': request.token_id, 'radius': request.radius},
+            revision=state.get('revision'),
+        )
+    return {'session_id': session_id, 'state': state}
+
+
 @router.post('/sessions/{session_id}/characters/import')
 async def import_character(session_id: str, request: CharacterImportRequest) -> dict:
     replay = _is_idempotency_replay(session_id, request.command)
@@ -403,6 +471,7 @@ def get_notes(
 
 @router.post('/sessions/{session_id}/encounter-templates')
 def add_template(session_id: str, request: EncounterTemplateRequest) -> dict:
+    _require_command_identity(session_id, request.command)
     templates = _dispatch_command(
         session_id,
         'add_encounter_template',
@@ -412,6 +481,402 @@ def add_template(session_id: str, request: EncounterTemplateRequest) -> dict:
     return templates
 
 
+@router.get('/sessions/{session_id}/journal-entries')
+def list_journal_entries(
+    session_id: str,
+    actor_peer_id: str | None = Query(default=None),
+    actor_token: str | None = Query(default=None),
+    actor_role: str | None = Query(default=None),
+) -> dict:
+    _require_read_identity(session_id, actor_peer_id, actor_token)
+    entries = session_service.get_journal_entries(
+        session_id,
+        command=CommandContext(actor_peer_id=actor_peer_id, actor_role=actor_role),
+    )
+    if entries is None:
+        raise HTTPException(status_code=404, detail='Session not found')
+    return {'session_id': session_id, 'journal_entries': entries}
+
+
+@router.post('/sessions/{session_id}/journal-entries')
+async def create_journal_entry(session_id: str, request: JournalEntryRequest) -> dict:
+    _require_command_identity(session_id, request.command)
+    replay = _is_idempotency_replay(session_id, request.command)
+    entry = _dispatch_command(
+        session_id,
+        'create_journal_entry',
+        {'title': request.title, 'content': request.content},
+        request.command,
+    )
+    if not replay:
+        await _publish_session_event(
+            session_id,
+            'journal_entry_created',
+            {'entry_id': entry.get('entry', {}).get('entry_id')},
+            revision=entry.get('revision'),
+        )
+    return entry
+
+
+@router.put('/sessions/{session_id}/journal-entries/{entry_id}')
+async def update_journal_entry(session_id: str, entry_id: str, request: JournalEntryUpdateRequest) -> dict:
+    _require_command_identity(session_id, request.command)
+    replay = _is_idempotency_replay(session_id, request.command)
+    entry = _dispatch_command(
+        session_id,
+        'update_journal_entry',
+        {'entry_id': entry_id, 'title': request.title, 'content': request.content},
+        request.command,
+    )
+    if not replay:
+        await _publish_session_event(
+            session_id,
+            'journal_entry_updated',
+            {'entry_id': entry_id},
+            revision=entry.get('revision'),
+        )
+    return entry
+
+
+@router.post('/sessions/{session_id}/journal-entries/{entry_id}/share')
+async def share_journal_entry(session_id: str, entry_id: str, request: ShareRequest) -> dict:
+    _require_command_identity(session_id, request.command)
+    replay = _is_idempotency_replay(session_id, request.command)
+    entry = _dispatch_command(
+        session_id,
+        'share_journal_entry',
+        {
+            'entry_id': entry_id,
+            'shared_roles': request.shared_roles,
+            'shared_peer_ids': request.shared_peer_ids,
+            'editable_roles': request.editable_roles,
+            'editable_peer_ids': request.editable_peer_ids,
+        },
+        request.command,
+    )
+    if not replay:
+        await _publish_session_event(
+            session_id,
+            'journal_entry_shared',
+            {'entry_id': entry_id},
+            revision=entry.get('revision'),
+        )
+    return entry
+
+
+@router.get('/sessions/{session_id}/handouts')
+def list_handouts(
+    session_id: str,
+    actor_peer_id: str | None = Query(default=None),
+    actor_token: str | None = Query(default=None),
+    actor_role: str | None = Query(default=None),
+) -> dict:
+    _require_read_identity(session_id, actor_peer_id, actor_token)
+    handouts = session_service.get_handouts(
+        session_id,
+        command=CommandContext(actor_peer_id=actor_peer_id, actor_role=actor_role),
+    )
+    if handouts is None:
+        raise HTTPException(status_code=404, detail='Session not found')
+    return {'session_id': session_id, 'handouts': handouts}
+
+
+@router.post('/sessions/{session_id}/handouts')
+async def create_handout(session_id: str, request: HandoutRequest) -> dict:
+    _require_command_identity(session_id, request.command)
+    replay = _is_idempotency_replay(session_id, request.command)
+    handout = _dispatch_command(
+        session_id,
+        'create_handout',
+        {'title': request.title, 'body': request.body},
+        request.command,
+    )
+    if not replay:
+        await _publish_session_event(
+            session_id,
+            'handout_created',
+            {'handout_id': handout.get('handout', {}).get('handout_id')},
+            revision=handout.get('revision'),
+        )
+    return handout
+
+
+@router.put('/sessions/{session_id}/handouts/{handout_id}')
+async def update_handout(session_id: str, handout_id: str, request: HandoutUpdateRequest) -> dict:
+    _require_command_identity(session_id, request.command)
+    replay = _is_idempotency_replay(session_id, request.command)
+    handout = _dispatch_command(
+        session_id,
+        'update_handout',
+        {'handout_id': handout_id, 'title': request.title, 'body': request.body},
+        request.command,
+    )
+    if not replay:
+        await _publish_session_event(
+            session_id,
+            'handout_updated',
+            {'handout_id': handout_id},
+            revision=handout.get('revision'),
+        )
+    return handout
+
+
+@router.post('/sessions/{session_id}/handouts/{handout_id}/share')
+async def share_handout(session_id: str, handout_id: str, request: ShareRequest) -> dict:
+    _require_command_identity(session_id, request.command)
+    replay = _is_idempotency_replay(session_id, request.command)
+    handout = _dispatch_command(
+        session_id,
+        'share_handout',
+        {
+            'handout_id': handout_id,
+            'shared_roles': request.shared_roles,
+            'shared_peer_ids': request.shared_peer_ids,
+            'editable_roles': request.editable_roles,
+            'editable_peer_ids': request.editable_peer_ids,
+        },
+        request.command,
+    )
+    if not replay:
+        await _publish_session_event(
+            session_id,
+            'handout_shared',
+            {'handout_id': handout_id},
+            revision=handout.get('revision'),
+        )
+    return handout
+
+
+@router.get('/sessions/{session_id}/assets')
+def list_assets(
+    session_id: str,
+    actor_peer_id: str | None = Query(default=None),
+    actor_token: str | None = Query(default=None),
+    actor_role: str | None = Query(default=None),
+) -> dict:
+    _require_read_identity(session_id, actor_peer_id, actor_token)
+    assets = session_service.get_asset_library(
+        session_id,
+        command=CommandContext(actor_peer_id=actor_peer_id, actor_role=actor_role),
+    )
+    if assets is None:
+        raise HTTPException(status_code=404, detail='Session not found')
+    return {'session_id': session_id, 'assets': assets}
+
+
+@router.post('/sessions/{session_id}/assets')
+async def add_asset_library_item(session_id: str, request: AssetLibraryItemRequest) -> dict:
+    _require_command_identity(session_id, request.command)
+    replay = _is_idempotency_replay(session_id, request.command)
+    asset = _dispatch_command(
+        session_id,
+        'add_asset_library_item',
+        {
+            'asset_id': request.asset_id,
+            'name': request.name,
+            'asset_type': request.asset_type,
+            'uri': request.uri,
+            'tags': request.tags,
+            'license': request.license,
+        },
+        request.command,
+    )
+    if not replay:
+        await _publish_session_event(
+            session_id,
+            'asset_library_item_added',
+            {'asset_id': request.asset_id},
+            revision=asset.get('revision'),
+        )
+    return asset
+
+
+@router.get('/sessions/{session_id}/macros')
+def list_macros(
+    session_id: str,
+    actor_peer_id: str | None = Query(default=None),
+    actor_token: str | None = Query(default=None),
+    actor_role: str | None = Query(default=None),
+) -> dict:
+    _require_read_identity(session_id, actor_peer_id, actor_token)
+    try:
+        macros = session_service.get_macros(
+            session_id,
+            command=CommandContext(actor_peer_id=actor_peer_id, actor_role=actor_role),
+        )
+    except SessionPermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    if macros is None:
+        raise HTTPException(status_code=404, detail='Session not found')
+    return {'session_id': session_id, 'macros': macros}
+
+
+@router.post('/sessions/{session_id}/macros')
+async def create_macro(session_id: str, request: MacroRequest) -> dict:
+    _require_command_identity(session_id, request.command)
+    replay = _is_idempotency_replay(session_id, request.command)
+    macro = _dispatch_command(
+        session_id,
+        'create_macro',
+        {'name': request.name, 'template': request.template},
+        request.command,
+    )
+    if not replay:
+        await _publish_session_event(
+            session_id,
+            'macro_created',
+            {'macro_id': macro.get('macro', {}).get('macro_id')},
+            revision=macro.get('revision'),
+        )
+    return macro
+
+
+@router.post('/sessions/{session_id}/macros/{macro_id}/run')
+async def run_macro(session_id: str, macro_id: str, request: RunMacroRequest) -> dict:
+    _require_command_identity(session_id, request.command)
+    replay = _is_idempotency_replay(session_id, request.command)
+    macro = _dispatch_command(
+        session_id,
+        'run_macro',
+        {'macro_id': macro_id, 'variables': request.variables},
+        request.command,
+    )
+    if not replay:
+        await _publish_session_event(
+            session_id,
+            'macro_ran',
+            {'macro_id': macro_id},
+            revision=macro.get('revision'),
+        )
+    return macro
+
+
+@router.get('/sessions/{session_id}/roll-templates')
+def list_roll_templates(
+    session_id: str,
+    actor_peer_id: str | None = Query(default=None),
+    actor_token: str | None = Query(default=None),
+    actor_role: str | None = Query(default=None),
+) -> dict:
+    _require_read_identity(session_id, actor_peer_id, actor_token)
+    try:
+        roll_templates = session_service.get_roll_templates(
+            session_id,
+            command=CommandContext(actor_peer_id=actor_peer_id, actor_role=actor_role),
+        )
+    except SessionPermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    if roll_templates is None:
+        raise HTTPException(status_code=404, detail='Session not found')
+    return {'session_id': session_id, 'roll_templates': roll_templates}
+
+
+@router.post('/sessions/{session_id}/roll-templates')
+async def create_roll_template(session_id: str, request: RollTemplateRequest) -> dict:
+    _require_command_identity(session_id, request.command)
+    replay = _is_idempotency_replay(session_id, request.command)
+    roll_template = _dispatch_command(
+        session_id,
+        'create_roll_template',
+        {'name': request.name, 'template': request.template, 'action_blocks': request.action_blocks},
+        request.command,
+    )
+    if not replay:
+        await _publish_session_event(
+            session_id,
+            'roll_template_created',
+            {'roll_template_id': roll_template.get('roll_template', {}).get('roll_template_id')},
+            revision=roll_template.get('revision'),
+        )
+    return roll_template
+
+
+@router.post('/sessions/{session_id}/roll-templates/{roll_template_id}/render')
+async def render_roll_template(session_id: str, roll_template_id: str, request: RenderRollTemplateRequest) -> dict:
+    _require_command_identity(session_id, request.command)
+    replay = _is_idempotency_replay(session_id, request.command)
+    rendered = _dispatch_command(
+        session_id,
+        'render_roll_template',
+        {'roll_template_id': roll_template_id, 'variables': request.variables},
+        request.command,
+    )
+    if not replay:
+        await _publish_session_event(
+            session_id,
+            'roll_template_rendered',
+            {'roll_template_id': roll_template_id},
+            revision=rendered.get('revision'),
+        )
+    return rendered
+
+
+@router.get('/sessions/{session_id}/plugins')
+def list_plugins(
+    session_id: str,
+    actor_peer_id: str | None = Query(default=None),
+    actor_token: str | None = Query(default=None),
+    actor_role: str | None = Query(default=None),
+) -> dict:
+    _require_read_identity(session_id, actor_peer_id, actor_token)
+    try:
+        plugins = session_service.get_plugins(
+            session_id,
+            command=CommandContext(actor_peer_id=actor_peer_id, actor_role=actor_role),
+        )
+    except SessionPermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    if plugins is None:
+        raise HTTPException(status_code=404, detail='Session not found')
+    return {'session_id': session_id, 'plugins': plugins}
+
+
+@router.post('/sessions/{session_id}/plugins')
+async def register_plugin(session_id: str, request: PluginRequest) -> dict:
+    _require_command_identity(session_id, request.command)
+    replay = _is_idempotency_replay(session_id, request.command)
+    plugin = _dispatch_command(
+        session_id,
+        'register_plugin',
+        {'name': request.name, 'version': request.version, 'capabilities': request.capabilities},
+        request.command,
+    )
+    if not replay:
+        await _publish_session_event(
+            session_id,
+            'plugin_registered',
+            {'plugin_id': plugin.get('plugin', {}).get('plugin_id')},
+            revision=plugin.get('revision'),
+        )
+    return plugin
+
+
+@router.post('/sessions/{session_id}/plugins/{plugin_id}/hooks/{hook_name}/execute')
+async def execute_plugin_hook(
+    session_id: str,
+    plugin_id: str,
+    hook_name: str,
+    request: ExecutePluginHookRequest,
+) -> dict:
+    _require_command_identity(session_id, request.command)
+    replay = _is_idempotency_replay(session_id, request.command)
+    result = _dispatch_command(
+        session_id,
+        'execute_plugin_hook',
+        {'plugin_id': plugin_id, 'hook_name': hook_name, 'payload': request.payload},
+        request.command,
+    )
+    if not replay:
+        event_type = 'plugin_hook_failed' if result.get('status') == 'isolated_failure' else 'plugin_hook_succeeded'
+        await _publish_session_event(
+            session_id,
+            event_type,
+            {'plugin_id': plugin_id, 'hook_name': hook_name},
+            revision=result.get('revision'),
+        )
+    return result
+
+
 @router.get('/sessions/{session_id}/encounter-templates')
 def get_templates(
     session_id: str,
@@ -419,7 +884,7 @@ def get_templates(
     actor_token: str | None = Query(default=None),
     actor_role: str | None = Query(default=None),
 ) -> dict:
-    _validate_read_identity(session_id, actor_peer_id, actor_token)
+    _require_read_identity(session_id, actor_peer_id, actor_token)
     templates = session_service.get_encounter_templates(
         session_id,
         command=CommandContext(actor_peer_id=actor_peer_id, actor_role=actor_role),

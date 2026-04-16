@@ -29,6 +29,20 @@ _RULES: dict[tuple[Resource, Action], PermissionRule] = {
     ('combat', 'mutate'): PermissionRule(allowed_roles=frozenset({'GM', 'AssistantGM'})),
     ('map', 'mutate'): PermissionRule(allowed_roles=frozenset({'GM', 'AssistantGM'})),
     ('character_import', 'mutate'): PermissionRule(allowed_roles=frozenset({'GM', 'AssistantGM'})),
+    ('journal', 'read'): PermissionRule(allowed_roles=frozenset({'GM', 'AssistantGM', 'Player', 'Observer'})),
+    ('journal', 'mutate'): PermissionRule(allowed_roles=frozenset({'GM', 'AssistantGM'})),
+    ('journal', 'share'): PermissionRule(allowed_roles=frozenset({'GM', 'AssistantGM'})),
+    ('handout', 'read'): PermissionRule(allowed_roles=frozenset({'GM', 'AssistantGM', 'Player', 'Observer'})),
+    ('handout', 'mutate'): PermissionRule(allowed_roles=frozenset({'GM', 'AssistantGM'})),
+    ('handout', 'share'): PermissionRule(allowed_roles=frozenset({'GM', 'AssistantGM'})),
+    ('asset_library', 'read'): PermissionRule(allowed_roles=frozenset({'GM', 'AssistantGM', 'Player', 'Observer'})),
+    ('asset_library', 'mutate'): PermissionRule(allowed_roles=frozenset({'GM', 'AssistantGM'})),
+    ('macro', 'read'): PermissionRule(allowed_roles=frozenset({'GM', 'AssistantGM'})),
+    ('macro', 'mutate'): PermissionRule(allowed_roles=frozenset({'GM', 'AssistantGM'})),
+    ('roll_template', 'read'): PermissionRule(allowed_roles=frozenset({'GM', 'AssistantGM'})),
+    ('roll_template', 'mutate'): PermissionRule(allowed_roles=frozenset({'GM', 'AssistantGM'})),
+    ('plugin', 'read'): PermissionRule(allowed_roles=frozenset({'GM', 'AssistantGM'})),
+    ('plugin', 'mutate'): PermissionRule(allowed_roles=frozenset({'GM', 'AssistantGM'})),
 }
 
 
