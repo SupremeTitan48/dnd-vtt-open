@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { Snapshot } from "../types";
 import type { MapTool } from "./MapToolsPanel";
 
@@ -20,6 +20,10 @@ type Props = {
   canEditMap: boolean;
   canMoveTokens: boolean;
   canControlToken: (tokenId: string) => boolean;
+  useVisibilityMask: boolean;
+  movementBudgetCells: number;
+  rulerPreset: { start: { x: number; y: number }; end: { x: number; y: number }; nonce: number } | null;
+  clearRulerSignal: number;
 };
 
 const TERRAIN_COLORS: Record<string, string> = {
@@ -52,6 +56,10 @@ export function MapCanvas({
   canEditMap,
   canMoveTokens,
   canControlToken,
+  useVisibilityMask,
+  movementBudgetCells,
+  rulerPreset,
+  clearRulerSignal,
 }: Props) {
   const size = 26;
   const width = snapshot.map.width * size;
@@ -59,6 +67,8 @@ export function MapCanvas({
 
   const [dragToken, setDragToken] = useState<string | null>(null);
   const [dragGhost, setDragGhost] = useState<{ x: number; y: number } | null>(null);
+  const [rulerStart, setRulerStart] = useState<{ x: number; y: number } | null>(null);
+  const [rulerEnd, setRulerEnd] = useState<{ x: number; y: number } | null>(null);
 
   const revealed = useMemo(
     () => new Set(snapshot.map.revealed_cells.map(([x, y]) => `${x}:${y}`)),
@@ -68,6 +78,21 @@ export function MapCanvas({
     () => new Set(snapshot.map.blocked_cells.map(([x, y]) => `${x}:${y}`)),
     [snapshot.map.blocked_cells],
   );
+  const visibilityMask = useMemo(() => {
+    if (!useVisibilityMask) return null;
+    const byToken = snapshot.map.visibility_cells_by_token;
+    if (!byToken) return null;
+    const visible = new Set<string>();
+    for (const cells of Object.values(byToken)) {
+      for (const [x, y] of cells) visible.add(`${x}:${y}`);
+    }
+    return visible.size > 0 ? visible : null;
+  }, [snapshot.map.visibility_cells_by_token, useVisibilityMask]);
+  const visibilityMaskActive = useVisibilityMask && visibilityMask !== null;
+  function isCellVisible(x: number, y: number): boolean {
+    if (!visibilityMask) return true;
+    return visibilityMask.has(`${x}:${y}`);
+  }
 
   function cellFromPointer(clientX: number, clientY: number, rect: DOMRect) {
     const x = Math.max(0, Math.min(snapshot.map.width - 1, Math.floor((clientX - rect.left) / size)));
@@ -94,6 +119,25 @@ export function MapCanvas({
     }
   }
 
+  const rulerDistanceCells = useMemo(() => {
+    if (!rulerStart || !rulerEnd) return null;
+    const dx = Math.abs(rulerEnd.x - rulerStart.x);
+    const dy = Math.abs(rulerEnd.y - rulerStart.y);
+    return Math.max(dx, dy);
+  }, [rulerStart, rulerEnd]);
+  const rulerDistanceFeet = rulerDistanceCells === null ? null : rulerDistanceCells * 5;
+  const withinBudget = rulerDistanceCells === null ? null : rulerDistanceCells <= movementBudgetCells;
+
+  useEffect(() => {
+    if (!rulerPreset) return;
+    setRulerStart(rulerPreset.start);
+    setRulerEnd(rulerPreset.end);
+  }, [rulerPreset?.nonce]);
+  useEffect(() => {
+    setRulerStart(null);
+    setRulerEnd(null);
+  }, [clearRulerSignal]);
+
   return (
     <div className="panel" style={{ overflow: "auto", padding: 8 }}>
       <svg
@@ -101,12 +145,26 @@ export function MapCanvas({
         height={height}
         style={{ background: "#191c2a", borderRadius: 10 }}
         onClick={(e) => {
-          if (activeTool === "move" || !canEditMap) return;
           const rect = (e.currentTarget as SVGSVGElement).getBoundingClientRect();
           const { x, y } = cellFromPointer(e.clientX, e.clientY, rect);
+          if (activeTool === "ruler") {
+            if (!rulerStart) {
+              setRulerStart({ x, y });
+              setRulerEnd({ x, y });
+            } else {
+              setRulerEnd({ x, y });
+            }
+            return;
+          }
+          if (activeTool === "move" || !canEditMap) return;
           applyCellTool(x, y);
         }}
         onMouseMove={(e) => {
+          if (activeTool === "ruler" && rulerStart) {
+            const rect = (e.currentTarget as SVGSVGElement).getBoundingClientRect();
+            setRulerEnd(cellFromPointer(e.clientX, e.clientY, rect));
+            return;
+          }
           if (!dragToken || activeTool !== "move" || !canMoveTokens) return;
           const rect = (e.currentTarget as SVGSVGElement).getBoundingClientRect();
           setDragGhost(cellFromPointer(e.clientX, e.clientY, rect));
@@ -125,6 +183,7 @@ export function MapCanvas({
       >
         {Object.entries(snapshot.map.terrain_tiles).map(([key, terrain]) => {
           const [x, y] = key.split(":").map(Number);
+          if (!isCellVisible(x, y)) return null;
           return <rect key={`terrain-${key}`} x={x * size} y={y * size} width={size} height={size} fill={TERRAIN_COLORS[terrain] ?? "#2a5f36"} opacity={0.85} />;
         })}
 
@@ -138,7 +197,8 @@ export function MapCanvas({
         {snapshot.map.fog_enabled &&
           Array.from({ length: snapshot.map.width }).flatMap((_, x) =>
             Array.from({ length: snapshot.map.height }).map((_, y) => {
-              const isRevealed = revealed.has(`${x}:${y}`);
+              const cellKey = `${x}:${y}`;
+              const isRevealed = visibilityMask ? visibilityMask.has(cellKey) : revealed.has(cellKey);
               return isRevealed ? null : (
                 <rect key={`fog-${x}-${y}`} x={x * size} y={y * size} width={size} height={size} fill="rgba(6, 7, 12, 0.78)" />
               );
@@ -147,6 +207,7 @@ export function MapCanvas({
 
         {Array.from(blocked).map((key) => {
           const [x, y] = key.split(":").map(Number);
+          if (!isCellVisible(x, y)) return null;
           return (
             <g key={`blocked-${key}`}>
               <rect x={x * size + 2} y={y * size + 2} width={size - 4} height={size - 4} fill="rgba(90,20,20,0.45)" />
@@ -158,6 +219,7 @@ export function MapCanvas({
 
         {Object.entries(snapshot.map.asset_stamps).map(([key, asset]) => {
           const [x, y] = key.split(":").map(Number);
+          if (!isCellVisible(x, y)) return null;
           return (
             <text key={`asset-${key}`} x={x * size + size / 2} y={y * size + size / 2 + 5} textAnchor="middle" fill="#f6e5b7" fontWeight={700} fontSize={14}>
               {ASSET_LABELS[asset] ?? "*"}
@@ -166,6 +228,7 @@ export function MapCanvas({
         })}
 
         {Object.entries(snapshot.map.token_positions).map(([tokenId, [x, y]]) => {
+          if (!isCellVisible(x, y)) return null;
           const selected = selectedTokens.includes(tokenId);
           return (
             <g
@@ -195,9 +258,29 @@ export function MapCanvas({
         {dragGhost && activeTool === "move" && (
           <circle cx={dragGhost.x * size + size / 2} cy={dragGhost.y * size + size / 2} r={11} fill="rgba(120, 198, 255, 0.35)" stroke="#9ed7ff" strokeDasharray="4 3" />
         )}
+
+        {rulerStart && rulerEnd && (
+          <g>
+            <line
+              x1={rulerStart.x * size + size / 2}
+              y1={rulerStart.y * size + size / 2}
+              x2={rulerEnd.x * size + size / 2}
+              y2={rulerEnd.y * size + size / 2}
+              stroke="#f5d66d"
+              strokeWidth={2}
+              strokeDasharray="6 4"
+            />
+            <circle cx={rulerStart.x * size + size / 2} cy={rulerStart.y * size + size / 2} r={4} fill="#f5d66d" />
+            <circle cx={rulerEnd.x * size + size / 2} cy={rulerEnd.y * size + size / 2} r={4} fill="#f5d66d" />
+          </g>
+        )}
       </svg>
       <div style={{ marginTop: 8, fontSize: 12, color: "#aab3dd" }}>
         Active tool: {activeTool}. Shift/Cmd-click multi-select tokens. Right-click token for quick actions.
+        {visibilityMaskActive ? " Visibility mask: active." : ""}
+        {rulerDistanceCells !== null
+          ? ` Ruler: ${rulerDistanceCells} cells (${rulerDistanceFeet} ft) - ${withinBudget ? "within" : "over"} budget (${movementBudgetCells}).`
+          : ""}
       </div>
     </div>
   );

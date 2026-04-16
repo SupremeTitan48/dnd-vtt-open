@@ -274,6 +274,134 @@ def test_player_websocket_redacts_unowned_actor_events() -> None:
         assert {} in event_payloads
 
 
+def test_visibility_recompute_emits_ws_event_and_replays_by_revision() -> None:
+    client = TestClient(app)
+    created = client.post('/api/sessions', json={"session_name": "VisionWS", "host_peer_id": "dm"})
+    session_id = created.json()['session_id']
+    host_token = created.json()['host_peer_token']
+
+    move = client.post(f'/api/sessions/{session_id}/move-token', json={"token_id": "hero", "x": 1, "y": 1})
+    block = client.post(
+        f'/api/sessions/{session_id}/toggle-blocked',
+        json={"x": 2, "y": 1, "command": {"expected_revision": 1}},
+    )
+    assert move.status_code == 200
+    assert block.status_code == 200
+
+    with client.websocket_connect(f"/api/sessions/{session_id}/events?actor_peer_id=dm&actor_token={host_token}") as ws:
+        ws.send_text('subscribe')
+        recompute = client.post(
+            f'/api/sessions/{session_id}/recompute-visibility',
+            json={"token_id": "hero", "radius": 3, "command": {"expected_revision": 2, "idempotency_key": "vision-evt-1"}},
+        )
+        assert recompute.status_code == 200
+        event = json.loads(ws.receive_text())
+        assert event['event_type'] == 'vision_updated'
+        assert event['revision'] == 3
+        assert event['payload']['token_id'] == 'hero'
+
+    duplicate = client.post(
+        f'/api/sessions/{session_id}/recompute-visibility',
+        json={"token_id": "hero", "radius": 1, "command": {"expected_revision": 3, "idempotency_key": "vision-evt-1"}},
+    )
+    assert duplicate.status_code == 200
+    assert duplicate.json()['state']['revision'] == 3
+
+    replay = client.get(
+        f'/api/sessions/{session_id}/events/replay',
+        params={"after_revision": 2, "actor_peer_id": "dm", "actor_token": host_token},
+    )
+    assert replay.status_code == 200
+    vision_events = [event for event in replay.json()['events'] if event.get('event_type') == 'vision_updated']
+    assert len(vision_events) == 1
+    assert vision_events[0]['revision'] == 3
+
+
+def test_visibility_events_are_filtered_by_token_ownership() -> None:
+    client = TestClient(app)
+    created = client.post('/api/sessions', json={"session_name": "VisionOwnershipEvents", "host_peer_id": "dm"})
+    session_id = created.json()['session_id']
+
+    join_p1 = client.post(f"/api/sessions/{session_id}/join", json={"peer_id": "p1"})
+    join_p2 = client.post(f"/api/sessions/{session_id}/join", json={"peer_id": "p2"})
+    assert join_p1.status_code == 200
+    assert join_p2.status_code == 200
+    p1_token = join_p1.json()['peer_token']
+    p2_token = join_p2.json()['peer_token']
+
+    hero = client.post(f"/api/sessions/{session_id}/move-token", json={"token_id": "hero", "x": 2, "y": 2})
+    assert hero.status_code == 200
+    owner = client.post(
+        f"/api/sessions/{session_id}/actor-ownership",
+        json={"actor_id": "hero", "peer_id": "p1", "command": {"expected_revision": 1}},
+    )
+    assert owner.status_code == 200
+
+    with client.websocket_connect(f"/api/sessions/{session_id}/events?actor_peer_id=p1&actor_token={p1_token}") as ws1, client.websocket_connect(
+        f"/api/sessions/{session_id}/events?actor_peer_id=p2&actor_token={p2_token}"
+    ) as ws2:
+        ws1.send_text('subscribe')
+        ws2.send_text('subscribe')
+        recompute = client.post(
+            f"/api/sessions/{session_id}/recompute-visibility",
+            json={"token_id": "hero", "radius": 3, "command": {"expected_revision": 2}},
+        )
+        assert recompute.status_code == 200
+        e1 = json.loads(ws1.receive_text())
+        e2 = json.loads(ws2.receive_text())
+        assert e1['event_type'] == 'vision_updated'
+        assert e2['event_type'] == 'vision_updated'
+        assert e1['payload'].get('token_id') == 'hero'
+        assert e2['payload'] == {}
+
+    replay_p1 = client.get(
+        f"/api/sessions/{session_id}/events/replay",
+        params={"after_revision": 2, "actor_peer_id": "p1", "actor_token": p1_token},
+    )
+    replay_p2 = client.get(
+        f"/api/sessions/{session_id}/events/replay",
+        params={"after_revision": 2, "actor_peer_id": "p2", "actor_token": p2_token},
+    )
+    assert replay_p1.status_code == 200
+    assert replay_p2.status_code == 200
+    p1_event = next(event for event in replay_p1.json()['events'] if event.get('event_type') == 'vision_updated')
+    p2_event = next(event for event in replay_p2.json()['events'] if event.get('event_type') == 'vision_updated')
+    assert p1_event['payload'].get('token_id') == 'hero'
+    assert p2_event['payload'] == {}
+
+
+def test_token_vision_updates_emit_single_event_on_idempotent_replay() -> None:
+    client = TestClient(app)
+    created = client.post('/api/sessions', json={"session_name": "TokenVisionReplay", "host_peer_id": "dm"})
+    session_id = created.json()['session_id']
+    host_token = created.json()['host_peer_token']
+
+    moved = client.post(f"/api/sessions/{session_id}/move-token", json={"token_id": "hero", "x": 1, "y": 1})
+    assert moved.status_code == 200
+
+    first = client.post(
+        f"/api/sessions/{session_id}/token-vision",
+        json={"token_id": "hero", "radius": 5, "command": {"expected_revision": 1, "idempotency_key": "vision-radius-1"}},
+    )
+    duplicate = client.post(
+        f"/api/sessions/{session_id}/token-vision",
+        json={"token_id": "hero", "radius": 2, "command": {"expected_revision": 2, "idempotency_key": "vision-radius-1"}},
+    )
+    assert first.status_code == 200
+    assert duplicate.status_code == 200
+    assert first.json()['state']['revision'] == 2
+    assert duplicate.json()['state']['revision'] == 2
+    assert duplicate.json()['state']['map']['vision_radius_by_token']['hero'] == 5
+
+    replay = client.get(
+        f'/api/sessions/{session_id}/events/replay',
+        params={"after_revision": 0, "actor_peer_id": "dm", "actor_token": host_token},
+    )
+    assert replay.status_code == 200
+    vision_events = [event for event in replay.json()['events'] if event.get('event_type') == 'token_vision_updated']
+    assert len(vision_events) == 1
+
+
 def test_event_replay_requires_actor_peer_id() -> None:
     client = TestClient(app)
     created = client.post('/api/sessions', json={"session_name": "ReplayAuth", "host_peer_id": "dm"})

@@ -1,12 +1,19 @@
-export type MapTool = "move" | "reveal" | "terrain" | "block" | "asset";
+import { useState } from "react";
+
+export type MapTool = "move" | "reveal" | "terrain" | "block" | "asset" | "ruler";
 
 type Props = {
   activeTool: MapTool;
   terrainType: string;
   assetId: string;
+  assetOptions: { asset_id: string; name: string }[];
   onSelectTool: (tool: MapTool) => void;
   onTerrainTypeChange: (terrainType: string) => void;
   onAssetIdChange: (assetId: string) => void;
+  movementBudgetCells: number;
+  onMovementBudgetCellsChange: (cells: number) => void;
+  onClearRuler: () => void;
+  onAddAssetOption: (assetId: string, name: string, uri: string) => Promise<void>;
   canEditMap: boolean;
 };
 
@@ -14,21 +21,48 @@ export function MapToolsPanel({
   activeTool,
   terrainType,
   assetId,
+  assetOptions,
   onSelectTool,
   onTerrainTypeChange,
   onAssetIdChange,
+  movementBudgetCells,
+  onMovementBudgetCellsChange,
+  onClearRuler,
+  onAddAssetOption,
   canEditMap,
 }: Props) {
+  const [newAssetId, setNewAssetId] = useState("");
+  const [newAssetName, setNewAssetName] = useState("");
+  const [newAssetUri, setNewAssetUri] = useState("");
   return (
     <div className="panel side-panel">
       <h3>Map Tools</h3>
       <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 6 }}>
         <button className={activeTool === "move" ? "active-tool" : ""} onClick={() => onSelectTool("move")}>Move</button>
+        <button className={activeTool === "ruler" ? "active-tool" : ""} onClick={() => onSelectTool("ruler")}>Ruler</button>
         <button className={activeTool === "reveal" ? "active-tool" : ""} onClick={() => onSelectTool("reveal")} disabled={!canEditMap}>Reveal</button>
         <button className={activeTool === "terrain" ? "active-tool" : ""} onClick={() => onSelectTool("terrain")} disabled={!canEditMap}>Terrain</button>
         <button className={activeTool === "block" ? "active-tool" : ""} onClick={() => onSelectTool("block")} disabled={!canEditMap}>Block</button>
         <button className={activeTool === "asset" ? "active-tool" : ""} onClick={() => onSelectTool("asset")} disabled={!canEditMap}>Asset</button>
       </div>
+
+      {activeTool === "ruler" && (
+        <div style={{ marginTop: 8 }}>
+          <label style={{ fontSize: 12, color: "#aab3dd" }}>
+            Movement budget (cells)
+            <input
+              type="number"
+              min={0}
+              value={movementBudgetCells}
+              onChange={(e) => onMovementBudgetCellsChange(Math.max(0, Math.floor(Number(e.target.value) || 0)))}
+              style={{ marginTop: 4, width: "100%" }}
+            />
+          </label>
+          <button style={{ marginTop: 6, width: "100%" }} onClick={onClearRuler}>
+            Clear Ruler
+          </button>
+        </div>
+      )}
 
       {activeTool === "terrain" && (
         <select value={terrainType} onChange={(e) => onTerrainTypeChange(e.target.value)} style={{ marginTop: 8, width: "100%" }} disabled={!canEditMap}>
@@ -41,13 +75,49 @@ export function MapToolsPanel({
       )}
 
       {activeTool === "asset" && (
-        <select value={assetId} onChange={(e) => onAssetIdChange(e.target.value)} style={{ marginTop: 8, width: "100%" }} disabled={!canEditMap}>
-          <option value="tree">Tree</option>
-          <option value="rock">Rock</option>
-          <option value="crate">Crate</option>
-          <option value="altar">Altar</option>
-          <option value="clear">Clear</option>
-        </select>
+        <>
+          <select value={assetId} onChange={(e) => onAssetIdChange(e.target.value)} style={{ marginTop: 8, width: "100%" }} disabled={!canEditMap}>
+            <option value="clear">Clear</option>
+            {assetOptions.map((asset) => (
+              <option key={asset.asset_id} value={asset.asset_id}>
+                {asset.name}
+              </option>
+            ))}
+          </select>
+          <input
+            placeholder="Asset ID"
+            value={newAssetId}
+            onChange={(e) => setNewAssetId(e.target.value)}
+            style={{ marginTop: 8, width: "100%" }}
+            disabled={!canEditMap}
+          />
+          <input
+            placeholder="Asset Name"
+            value={newAssetName}
+            onChange={(e) => setNewAssetName(e.target.value)}
+            style={{ marginTop: 6, width: "100%" }}
+            disabled={!canEditMap}
+          />
+          <input
+            placeholder="Asset URI"
+            value={newAssetUri}
+            onChange={(e) => setNewAssetUri(e.target.value)}
+            style={{ marginTop: 6, width: "100%" }}
+            disabled={!canEditMap}
+          />
+          <button
+            style={{ marginTop: 6 }}
+            disabled={!canEditMap || !newAssetId.trim() || !newAssetName.trim() || !newAssetUri.trim()}
+            onClick={async () => {
+              await onAddAssetOption(newAssetId.trim(), newAssetName.trim(), newAssetUri.trim());
+              setNewAssetId("");
+              setNewAssetName("");
+              setNewAssetUri("");
+            }}
+          >
+            Add Asset To Library
+          </button>
+        </>
       )}
     </div>
   );

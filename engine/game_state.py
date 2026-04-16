@@ -47,6 +47,12 @@ class GameStateEngine:
     def stamp_asset(self, x: int, y: int, asset_id: str) -> None:
         self.map_state.stamp_asset(x, y, asset_id)
 
+    def compute_visible_cells(self, token_id: str, radius: int) -> set[tuple[int, int]]:
+        return self.map_state.recompute_visibility(token_id, radius)
+
+    def set_token_vision_radius(self, token_id: str, radius: int) -> set[tuple[int, int]]:
+        return self.map_state.set_token_vision_radius(token_id, radius)
+
     def snapshot(self) -> dict[str, Any]:
         return {
             "map": {
@@ -58,6 +64,11 @@ class GameStateEngine:
                 "terrain_tiles": {f"{x}:{y}": t for (x, y), t in self.map_state.terrain_tiles.items()},
                 "blocked_cells": list(self.map_state.blocked_cells),
                 "asset_stamps": {f"{x}:{y}": a for (x, y), a in self.map_state.asset_stamps.items()},
+                "visibility_cells_by_token": {
+                    token_id: [list(cell) for cell in sorted(cells)]
+                    for token_id, cells in self.map_state.visibility_cells_by_token.items()
+                },
+                "vision_radius_by_token": self.map_state.vision_radius_by_token,
             },
             "combat": {
                 "initiative_order": self.combat_tracker.initiative_order,
@@ -92,6 +103,14 @@ class GameStateEngine:
         engine.map_state.asset_stamps = {
             tuple(int(v) for v in key.split(":")): val
             for key, val in map_data.get("asset_stamps", {}).items()
+        }
+        engine.map_state.visibility_cells_by_token = {
+            token_id: {tuple(cell) for cell in cells}
+            for token_id, cells in map_data.get("visibility_cells_by_token", {}).items()
+        }
+        engine.map_state.vision_radius_by_token = {
+            token_id: int(radius)
+            for token_id, radius in map_data.get("vision_radius_by_token", {}).items()
         }
 
         combat_data = data.get("combat", {})
