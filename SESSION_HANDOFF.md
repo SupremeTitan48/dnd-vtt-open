@@ -5,12 +5,12 @@ This file captures implementation progress so a fresh chat can continue without 
 ## Current Status
 
 - Overall roadmap status:
-  - Phase 0: mostly complete.
-  - Phase 1: substantial progress, not fully complete.
-  - Phases 2-5: mostly not started.
-
-- Approximate completion:
-  - Phase 1: ~75-80%.
+  - Phase 0: substantially complete.
+  - Phase 1: substantially complete (hardening still open).
+  - Phase 2: foundation complete.
+  - Phase 3: current tactical visibility slice complete.
+  - Phase 4: in progress (automation/extensibility foundations implemented).
+  - Phase 5: not started.
 
 ## What Is Implemented
 
@@ -68,6 +68,28 @@ This file captures implementation progress so a fresh chat can continue without 
   - observer restrictions
   - GM/AssistantGM restrictions for GM tools/map edit actions.
 
+### Phase 4 Automation / Extensibility Foundations
+
+- Macro subsystem:
+  - `GET /api/sessions/{session_id}/macros`
+  - `POST /api/sessions/{session_id}/macros`
+  - `POST /api/sessions/{session_id}/macros/{macro_id}/run`
+  - execution audits in campaign state + WS/replay events.
+- Roll template subsystem:
+  - `GET /api/sessions/{session_id}/roll-templates`
+  - `POST /api/sessions/{session_id}/roll-templates`
+  - `POST /api/sessions/{session_id}/roll-templates/{roll_template_id}/render`
+  - reusable action blocks + render audits + WS/replay events.
+- Plugin subsystem:
+  - `GET /api/sessions/{session_id}/plugins`
+  - `POST /api/sessions/{session_id}/plugins`
+  - `POST /api/sessions/{session_id}/plugins/{plugin_id}/hooks/{hook_name}/execute`
+  - isolated failure behavior (plugin failure does not crash core session flow).
+- Frontend control surfaces:
+  - `MacroPanel`, `RollTemplatePanel`, `PluginPanel`
+  - shown for `GM`/`AssistantGM` only
+  - inline parse validation + focused component tests (Vitest).
+
 ## Must-Not-Break Invariants
 
 - Backend is authoritative for game state mutations.
@@ -118,29 +140,26 @@ npm --prefix frontend run build
 
 ## Remaining Phase 1 Work (Priority)
 
-1. Centralize permission matrix (single evaluator used by all routes/services) to remove remaining ad hoc checks.
-2. Expand object-level ACL/visibility coverage beyond current entities/surfaces.
-3. Add deeper multiplayer correctness tests:
+1. Expand object-level ACL/visibility coverage beyond current entities/surfaces.
+2. Add deeper multiplayer correctness tests:
    - out-of-order sequences
    - duplicate delivery
    - concurrent edit race scenarios across more command types.
-4. Complete frontend parity for all remaining role/ownership edge interactions.
+3. Complete frontend parity for all remaining role/ownership edge interactions.
 
 ## Recommended Next 3 Tasks
 
-1. Introduce `app/policies/permission_matrix.py` with explicit `(role, resource, action)` rules and replace direct checks incrementally.
-2. Add service/API-level permission guards for all read endpoints still lacking explicit matrix-based policy checks.
-3. Add integration tests for matrix enforcement over:
-   - session read,
-   - state read,
-   - characters read,
-   - combat control,
-   - map edit,
-   - actor/token mutate.
+1. Phase 4 hardening pass:
+   - add more failure-path and replay redaction tests for macro/roll/plugin flows.
+   - tighten capability validation semantics and error contract consistency.
+2. Frontend polish for Phase 4:
+   - improve per-panel success/failure messaging and execution history visibility.
+3. Roadmap completion prep:
+   - align docs and capture explicit acceptance criteria for closing Phase 4.
 
 ## Suggested Prompt For New Chat
 
 Use this exact prompt in a fresh thread:
 
-> Continue implementation from `SESSION_HANDOFF.md`. Do not redo completed work. Prioritize finishing Phase 1 by implementing a centralized permission matrix and expanding policy coverage + tests. Run `ruff`, `pytest`, and frontend build after changes, and report updated Phase 1 completion percentage.
+> Continue implementation from `SESSION_HANDOFF.md`. Do not redo completed work. Prioritize Phase 4 hardening for macro/roll-template/plugin workflows (tests, validation, error contracts, and UI feedback). Run `ruff`, `pytest`, frontend tests, and frontend build, then summarize remaining work for Phase 4 exit.
 
