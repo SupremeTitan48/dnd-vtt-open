@@ -32,6 +32,7 @@ Run:
 curl -s http://127.0.0.1:8000/health
 curl -s http://127.0.0.1:8000/health/ready
 curl -s http://127.0.0.1:8000/health/perf
+curl -s http://127.0.0.1:8000/health/ops
 ```
 
 Expected:
@@ -41,6 +42,10 @@ Expected:
   - `event_log_dir`
   - `migration_compatibility`
 - `/health/perf` returns visibility metrics with `ok=true`.
+- `/health/ops` returns operational metrics with `ok=true`, including:
+  - `backup_audit_events_total`
+  - `backup_audit_actions`
+  - `backup_rate_limit_config`
 
 ## Backup workflow
 

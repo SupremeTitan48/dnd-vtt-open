@@ -78,6 +78,7 @@ For operations workflows, see `docs/operations.md`.
 ## Phase 5 status (production readiness)
 - Initial slice in place:
   - Added `/health/ready` readiness endpoint for basic operational checks.
+  - Added `/health/ops` operational endpoint for backup audit/rate-limit metrics.
   - Readiness checks currently verify writable session store and event log directories.
   - Added backup/restore APIs for session snapshots and metadata recovery.
   - Added backup retention APIs for listing/pruning stored backups.

@@ -1452,6 +1452,8 @@ class SessionService:
     def get_visibility_perf_metrics(self) -> dict[str, Any]:
         total_hits = 0
         total_misses = 0
+        backup_audit_total = 0
+        backup_actions: dict[str, int] = {}
         sessions: list[dict[str, Any]] = []
         for session_id, engine in self.engines.items():
             hits = engine.map_state.visibility_cache_hits
@@ -1466,9 +1468,36 @@ class SessionService:
                     'blocker_revision': engine.map_state.blocker_revision,
                 }
             )
+        for campaign in self.campaigns.values():
+            for audit in campaign.get('backup_audit', []):
+                if not isinstance(audit, dict):
+                    continue
+                backup_audit_total += 1
+                action = audit.get('action')
+                if isinstance(action, str):
+                    backup_actions[action] = backup_actions.get(action, 0) + 1
         return {
             'active_sessions': len(self.sessions),
             'visibility_cache_hits': total_hits,
             'visibility_cache_misses': total_misses,
+            'backup_audit_events_total': backup_audit_total,
+            'backup_audit_actions': backup_actions,
             'sessions': sessions,
+        }
+
+    def get_backup_ops_metrics(self) -> dict[str, Any]:
+        backup_audit_total = 0
+        backup_actions: dict[str, int] = {}
+        for campaign in self.campaigns.values():
+            for audit in campaign.get('backup_audit', []):
+                if not isinstance(audit, dict):
+                    continue
+                backup_audit_total += 1
+                action = audit.get('action')
+                if isinstance(action, str):
+                    backup_actions[action] = backup_actions.get(action, 0) + 1
+        return {
+            'active_sessions': len(self.sessions),
+            'backup_audit_events_total': backup_audit_total,
+            'backup_audit_actions': backup_actions,
         }

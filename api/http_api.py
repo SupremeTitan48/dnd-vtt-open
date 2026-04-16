@@ -170,6 +170,12 @@ def _check_backup_rate_limit(session_id: str, actor_peer_id: str) -> None:
     while bucket and bucket[0] < window_start:
         bucket.popleft()
     if len(bucket) >= limit:
+        session_service.record_backup_audit(
+            session_id,
+            actor_peer_id=actor_peer_id,
+            action='backup_rate_limited',
+            detail={'limit': limit, 'window_seconds': window_seconds},
+        )
         raise HTTPException(status_code=429, detail='backup operation rate limit exceeded')
     bucket.append(now)
 

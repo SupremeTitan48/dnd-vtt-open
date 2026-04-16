@@ -79,6 +79,8 @@ def test_health_perf_reports_visibility_cache_metrics() -> None:
     assert body['active_sessions'] >= 1
     assert body['visibility_cache_hits'] >= 1
     assert body['visibility_cache_misses'] >= 1
+    assert isinstance(body['backup_audit_events_total'], int)
+    assert isinstance(body['backup_audit_actions'], dict)
     session_metrics = next(item for item in body['sessions'] if item['session_id'] == session_id)
     assert isinstance(session_metrics['visibility_cache_hits'], int)
     assert isinstance(session_metrics['visibility_cache_misses'], int)
@@ -999,6 +1001,32 @@ def test_backup_rate_limit_respects_configured_limit(monkeypatch) -> None:
     assert first.status_code == 200
     assert second.status_code == 200
     assert third.status_code == 429
+    perf = client.get('/health/perf')
+    assert perf.status_code == 200
+    assert perf.json()['backup_audit_actions'].get('backup_rate_limited', 0) >= 1
+
+
+def test_health_ops_reports_backup_operational_metrics(monkeypatch) -> None:
+    monkeypatch.setenv("DND_VTT_BACKUP_RATE_LIMIT_MAX", "2")
+    monkeypatch.setenv("DND_VTT_BACKUP_RATE_LIMIT_WINDOW_SECONDS", "60")
+    client = TestClient(app)
+    created = client.post('/api/sessions', json={"session_name": "OpsHealth", "host_peer_id": "dm"})
+    session_id = created.json()['session_id']
+    host_token = created.json()['host_peer_token']
+    host_command = {"actor_peer_id": "dm", "actor_token": host_token}
+
+    client.post(f'/api/sessions/{session_id}/backup', json={"command": host_command})
+    client.post(f'/api/sessions/{session_id}/backup', json={"command": host_command})
+    client.post(f'/api/sessions/{session_id}/backup', json={"command": host_command})
+
+    ops = client.get('/health/ops')
+    assert ops.status_code == 200
+    body = ops.json()
+    assert body['ok'] is True
+    assert isinstance(body['backup_audit_events_total'], int)
+    assert isinstance(body['backup_audit_actions'], dict)
+    assert body['backup_audit_actions'].get('backup_rate_limited', 0) >= 1
+    assert body['backup_rate_limit_config'] == {'max_operations': 2, 'window_seconds': 60}
 
 
 def test_visibility_recompute_enforces_permissions_and_revision_idempotency() -> None:
