@@ -50,6 +50,19 @@ def test_create_session_returns_host_peer_token() -> None:
     assert created.json()["host_peer_token"]
 
 
+def test_cors_preflight_allows_desktop_and_dev_origins() -> None:
+    client = TestClient(app)
+    response = client.options(
+        "/api/sessions",
+        headers={
+            "Origin": "http://127.0.0.1:5173",
+            "Access-Control-Request-Method": "POST",
+        },
+    )
+    assert response.status_code == 200
+    assert response.headers.get("access-control-allow-origin") == "http://127.0.0.1:5173"
+
+
 def test_health_perf_reports_visibility_cache_metrics() -> None:
     client = TestClient(app)
     created = client.post('/api/sessions', json={"session_name": "PerfHealth", "host_peer_id": "dm"})
@@ -103,6 +116,80 @@ def test_health_ready_reports_basic_operational_checks() -> None:
     assert migration['compatible'] is True
 
 
+def test_session_migration_dry_run_and_apply_flow() -> None:
+    client = TestClient(app)
+    created = client.post('/api/sessions', json={"session_name": "MigrateSession", "host_peer_id": "dm"})
+    session_id = created.json()['session_id']
+    host_token = created.json()['host_peer_token']
+    host_command = {"actor_peer_id": "dm", "actor_token": host_token}
+
+    # Simulate a pre-migration session persisted at schema version 1.
+    session_service.sessions[session_id]['schema_version'] = 1
+    session_service.sessions[session_id].pop('migration_history', None)
+
+    dry_run = client.post(
+        f'/api/sessions/{session_id}/migrate',
+        json={"dry_run": True, "command": host_command},
+    )
+    assert dry_run.status_code == 200
+    dry_body = dry_run.json()
+    assert dry_body['dry_run'] is True
+    assert dry_body['from_schema_version'] == 1
+    assert dry_body['to_schema_version'] >= 2
+    assert dry_body['migrated'] is False
+    assert dry_body['applied_migrations']
+    assert session_service.sessions[session_id]['schema_version'] == 1
+
+    applied = client.post(
+        f'/api/sessions/{session_id}/migrate',
+        json={"dry_run": False, "command": host_command},
+    )
+    assert applied.status_code == 200
+    apply_body = applied.json()
+    assert apply_body['dry_run'] is False
+    assert apply_body['from_schema_version'] == 1
+    assert apply_body['migrated'] is True
+    assert apply_body['to_schema_version'] >= 2
+    assert session_service.sessions[session_id]['schema_version'] == apply_body['to_schema_version']
+    assert session_service.sessions[session_id]['migration_history']
+
+    already_current = client.post(
+        f'/api/sessions/{session_id}/migrate',
+        json={"dry_run": False, "command": host_command},
+    )
+    assert already_current.status_code == 200
+    current_body = already_current.json()
+    assert current_body['migrated'] is False
+    assert current_body['applied_migrations'] == []
+
+
+def test_session_migration_requires_privileged_identity() -> None:
+    client = TestClient(app)
+    created = client.post('/api/sessions', json={"session_name": "MigrateAuthz", "host_peer_id": "dm"})
+    session_id = created.json()['session_id']
+    host_token = created.json()['host_peer_token']
+
+    joined = client.post(f"/api/sessions/{session_id}/join", json={"peer_id": "p1"})
+    assert joined.status_code == 200
+    p1_token = joined.json()['peer_token']
+    player_command = {"actor_peer_id": "p1", "actor_token": p1_token}
+
+    no_identity = client.post(f'/api/sessions/{session_id}/migrate', json={"dry_run": True})
+    assert no_identity.status_code == 403
+
+    player_denied = client.post(
+        f'/api/sessions/{session_id}/migrate',
+        json={"dry_run": True, "command": player_command},
+    )
+    assert player_denied.status_code == 403
+
+    host_allowed = client.post(
+        f'/api/sessions/{session_id}/migrate',
+        json={"dry_run": True, "command": {"actor_peer_id": "dm", "actor_token": host_token}},
+    )
+    assert host_allowed.status_code == 200
+
+
 def test_feature_endpoints_for_import_fog_and_dm_tools() -> None:
     client = TestClient(app)
     created = client.post('/api/sessions', json={"session_name": "Feature Test", "host_peer_id": "dm"})
@@ -129,6 +216,8 @@ def test_feature_endpoints_for_import_fog_and_dm_tools() -> None:
 
     reveal = client.post(f'/api/sessions/{session_id}/reveal-cell', json={"x": 1, "y": 1})
     assert reveal.status_code == 200
+    hide = client.post(f'/api/sessions/{session_id}/hide-cell', json={"x": 1, "y": 1})
+    assert hide.status_code == 200
 
     notes = client.put(f'/api/sessions/{session_id}/notes', json={"notes": "Remember to pace combat."})
     assert notes.status_code == 200
@@ -882,6 +971,41 @@ def test_list_and_prune_backups_retains_latest_entries() -> None:
     assert len(after.json()['backups']) == 1
 
 
+def test_prune_backups_by_age_deletes_only_older_entries() -> None:
+    import json
+    from datetime import datetime, timedelta, timezone
+    from pathlib import Path
+
+    client = TestClient(app)
+    created = client.post('/api/sessions', json={"session_name": "BackupRetentionByAge", "host_peer_id": "dm"})
+    session_id = created.json()['session_id']
+    host_token = created.json()['host_peer_token']
+    host_command = {"actor_peer_id": "dm", "actor_token": host_token}
+
+    first = client.post(f'/api/sessions/{session_id}/backup', json={"command": host_command})
+    second = client.post(f'/api/sessions/{session_id}/backup', json={"command": host_command})
+    assert first.status_code == 200
+    assert second.status_code == 200
+
+    old_backup_id = first.json()['backup_id']
+    old_path = Path(first.json()['backup_path'])
+    old_payload = json.loads(old_path.read_text())
+    old_payload['created_at'] = (datetime.now(timezone.utc) - timedelta(days=14)).isoformat()
+    old_path.write_text(json.dumps(old_payload, indent=2))
+
+    prune = client.post(
+        f'/api/sessions/{session_id}/backups/prune-by-age',
+        json={"max_age_days": 7, "command": host_command},
+    )
+    assert prune.status_code == 200
+    assert prune.json()['deleted'] >= 1
+
+    listed = client.get(f'/api/sessions/{session_id}/backups', params={"actor_peer_id": "dm", "actor_token": host_token})
+    assert listed.status_code == 200
+    remaining_ids = {item['backup_id'] for item in listed.json()['backups']}
+    assert old_backup_id not in remaining_ids
+
+
 def test_backup_export_and_import_with_checksum_validation() -> None:
     client = TestClient(app)
     created = client.post('/api/sessions', json={"session_name": "BackupPortability", "host_peer_id": "dm"})
@@ -919,6 +1043,107 @@ def test_backup_export_and_import_with_checksum_validation() -> None:
         json={"backup": export_body['backup'], "checksum_sha256": "0" * 64, "command": host_command},
     )
     assert tampered.status_code == 400
+
+
+def test_backup_import_rejects_oversized_payload() -> None:
+    client = TestClient(app)
+    created = client.post('/api/sessions', json={"session_name": "BackupImportSize", "host_peer_id": "dm"})
+    session_id = created.json()['session_id']
+    host_token = created.json()['host_peer_token']
+    host_command = {"actor_peer_id": "dm", "actor_token": host_token}
+
+    oversized_backup = {
+        "backup_id": "oversized",
+        "session_id": session_id,
+        "created_at": "2026-01-01T00:00:00+00:00",
+        "snapshot": {"map": {"token_positions": {"hero": [1, 1]}}},
+        "session": {"session_id": session_id, "campaign_id": session_id},
+        "campaign": {"campaign_id": session_id},
+        "events": [{"event_type": "x", "payload": {"blob": "a" * 300_000}}],
+    }
+    import hashlib
+    import json
+
+    checksum = hashlib.sha256(json.dumps(oversized_backup, sort_keys=True, separators=(',', ':')).encode('utf-8')).hexdigest()
+    response = client.post(
+        f'/api/sessions/{session_id}/backups/import',
+        json={"backup": oversized_backup, "checksum_sha256": checksum, "command": host_command},
+    )
+    assert response.status_code == 400
+    assert "too large" in str(response.json().get("detail", "")).lower()
+
+
+def test_backup_import_size_limit_respects_configured_max(monkeypatch) -> None:
+    import hashlib
+    import json
+
+    monkeypatch.setenv("DND_VTT_BACKUP_IMPORT_MAX_BYTES", "120000")
+    client = TestClient(app)
+    created = client.post('/api/sessions', json={"session_name": "BackupImportSizeConfig", "host_peer_id": "dm"})
+    session_id = created.json()['session_id']
+    host_token = created.json()['host_peer_token']
+    host_command = {"actor_peer_id": "dm", "actor_token": host_token}
+
+    payload = {
+        "backup_id": "configured",
+        "session_id": session_id,
+        "created_at": "2026-01-01T00:00:00+00:00",
+        "snapshot": {"map": {"token_positions": {"hero": [1, 1]}}},
+        "session": {"session_id": session_id, "campaign_id": session_id},
+        "campaign": {"campaign_id": session_id},
+        "events": [{"event_type": "x", "payload": {"blob": "a" * 130_000}}],
+    }
+    checksum = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(',', ':')).encode('utf-8')).hexdigest()
+    response = client.post(
+        f'/api/sessions/{session_id}/backups/import',
+        json={"backup": payload, "checksum_sha256": checksum, "command": host_command},
+    )
+    assert response.status_code == 400
+    assert "too large" in str(response.json().get("detail", "")).lower()
+
+
+def test_backup_export_import_signature_enforced_when_secret_set(monkeypatch) -> None:
+    monkeypatch.setenv("DND_VTT_BACKUP_SIGNING_SECRET", "top-secret-signing-key")
+    client = TestClient(app)
+    created = client.post('/api/sessions', json={"session_name": "BackupSignature", "host_peer_id": "dm"})
+    session_id = created.json()['session_id']
+    host_token = created.json()['host_peer_token']
+    host_command = {"actor_peer_id": "dm", "actor_token": host_token}
+
+    backed_up = client.post(f'/api/sessions/{session_id}/backup', json={"command": host_command})
+    assert backed_up.status_code == 200
+    backup_id = backed_up.json()['backup_id']
+
+    exported = client.get(
+        f'/api/sessions/{session_id}/backups/{backup_id}/export',
+        params={"actor_peer_id": "dm", "actor_token": host_token},
+    )
+    assert exported.status_code == 200
+    payload = exported.json()
+    assert payload.get("signature_hmac_sha256")
+
+    valid_import = client.post(
+        f'/api/sessions/{session_id}/backups/import',
+        json={
+            "backup": payload["backup"],
+            "checksum_sha256": payload["checksum_sha256"],
+            "signature_hmac_sha256": payload["signature_hmac_sha256"],
+            "command": host_command,
+        },
+    )
+    assert valid_import.status_code == 200
+
+    invalid_import = client.post(
+        f'/api/sessions/{session_id}/backups/import',
+        json={
+            "backup": payload["backup"],
+            "checksum_sha256": payload["checksum_sha256"],
+            "signature_hmac_sha256": "0" * 64,
+            "command": host_command,
+        },
+    )
+    assert invalid_import.status_code == 400
+    assert "signature" in str(invalid_import.json().get("detail", "")).lower()
 
 
 def test_backup_operations_require_privileged_identity() -> None:
@@ -1027,6 +1252,28 @@ def test_health_ops_reports_backup_operational_metrics(monkeypatch) -> None:
     assert isinstance(body['backup_audit_actions'], dict)
     assert body['backup_audit_actions'].get('backup_rate_limited', 0) >= 1
     assert body['backup_rate_limit_config'] == {'max_operations': 2, 'window_seconds': 60}
+
+
+def test_metrics_endpoint_exports_prometheus_style_operational_metrics() -> None:
+    client = TestClient(app)
+    created = client.post('/api/sessions', json={"session_name": "MetricsOps", "host_peer_id": "dm"})
+    session_id = created.json()['session_id']
+    host_token = created.json()['host_peer_token']
+    host_command = {"actor_peer_id": "dm", "actor_token": host_token}
+
+    backup = client.post(f'/api/sessions/{session_id}/backup', json={"command": host_command})
+    assert backup.status_code == 200
+
+    metrics = client.get('/metrics')
+    assert metrics.status_code == 200
+    body = metrics.text
+    assert 'dnd_vtt_active_sessions' in body
+    assert 'dnd_vtt_visibility_cache_hits' in body
+    assert 'dnd_vtt_visibility_cache_misses' in body
+    assert 'dnd_vtt_backup_audit_events_total' in body
+    assert 'dnd_vtt_backup_audit_action_total{action="backup_created"}' in body
+    assert 'dnd_vtt_backup_rate_limit_max' in body
+    assert 'dnd_vtt_backup_rate_limit_window_seconds' in body
 
 
 def test_visibility_recompute_enforces_permissions_and_revision_idempotency() -> None:

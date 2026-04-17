@@ -8,6 +8,7 @@ from api_contracts.commands import (
     AddAssetLibraryItemCommand,
     CreateMacroCommand,
     ExecutePluginHookCommand,
+    HideCellCommand,
     CreateRollTemplateCommand,
     AssignActorOwnerCommand,
     AssignSessionRoleCommand,
@@ -56,6 +57,7 @@ class CommandDispatcher:
             'update_actor': self._handle_update_actor,
             'set_fog': self._handle_set_fog,
             'reveal_cell': self._handle_reveal_cell,
+            'hide_cell': self._handle_hide_cell,
             'paint_terrain': self._handle_paint_terrain,
             'toggle_blocked': self._handle_toggle_blocked,
             'stamp_asset': self._handle_stamp_asset,
@@ -87,6 +89,7 @@ class CommandDispatcher:
             'update_actor': UpdateActorCommand,
             'set_fog': SetFogCommand,
             'reveal_cell': RevealCellCommand,
+            'hide_cell': HideCellCommand,
             'paint_terrain': PaintTerrainCommand,
             'toggle_blocked': ToggleBlockedCommand,
             'stamp_asset': StampAssetCommand,
@@ -159,6 +162,9 @@ class CommandDispatcher:
 
     def _handle_reveal_cell(self, session_id: str, payload: dict[str, Any], command: CommandContext) -> dict[str, Any] | None:
         return self._session_service.reveal_cell(session_id, payload['x'], payload['y'], command=command)
+
+    def _handle_hide_cell(self, session_id: str, payload: dict[str, Any], command: CommandContext) -> dict[str, Any] | None:
+        return self._session_service.hide_cell(session_id, payload['x'], payload['y'], command=command)
 
     def _handle_paint_terrain(self, session_id: str, payload: dict[str, Any], command: CommandContext) -> dict[str, Any] | None:
         return self._session_service.paint_terrain(session_id, payload['x'], payload['y'], payload['terrain_type'], command=command)

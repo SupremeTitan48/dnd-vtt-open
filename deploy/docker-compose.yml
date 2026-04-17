@@ -1,0 +1,23 @@
+version: "3.9"
+
+services:
+  backend:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.backend
+    environment:
+      DND_VTT_SESSION_STORE_BACKEND: sqlite
+      DND_VTT_SESSION_STORE_DIR: /data/sessions
+      DND_VTT_SESSION_STORE_SQLITE_PATH: /data/sessions/sessions.db
+      DND_VTT_OPS_STATE_BACKEND: sqlite
+      DND_VTT_OPS_STATE_SQLITE_PATH: /data/sessions/ops_state.db
+      DND_VTT_BACKUP_RATE_LIMIT_MAX: "5"
+      DND_VTT_BACKUP_RATE_LIMIT_WINDOW_SECONDS: "60"
+      DND_VTT_BACKUP_IMPORT_MAX_BYTES: "256000"
+    volumes:
+      - dnd_data:/data/sessions
+    ports:
+      - "8000:8000"
+
+volumes:
+  dnd_data:

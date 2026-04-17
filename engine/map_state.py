@@ -98,6 +98,10 @@ class MapState:
         self._validate_cell(x, y)
         self.revealed_cells.add((x, y))
 
+    def hide_cell(self, x: int, y: int) -> None:
+        self._validate_cell(x, y)
+        self.revealed_cells.discard((x, y))
+
     def paint_terrain(self, x: int, y: int, terrain_type: str) -> None:
         self._validate_cell(x, y)
         if terrain_type == "clear":

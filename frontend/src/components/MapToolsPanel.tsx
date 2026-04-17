@@ -1,6 +1,7 @@
 import { useState } from "react";
 
 export type MapTool = "move" | "reveal" | "terrain" | "block" | "asset" | "ruler";
+export type FogMode = "reveal" | "rehide";
 
 type Props = {
   activeTool: MapTool;
@@ -15,6 +16,13 @@ type Props = {
   onClearRuler: () => void;
   onAddAssetOption: (assetId: string, name: string, uri: string) => Promise<void>;
   canEditMap: boolean;
+  fogEnabled: boolean;
+  fogMode: FogMode;
+  previewPlayerView: boolean;
+  onFogModeChange: (mode: FogMode) => void;
+  onToggleFog: () => void;
+  onHideAllFog: () => void;
+  onTogglePreviewPlayerView: () => void;
 };
 
 export function MapToolsPanel({
@@ -30,6 +38,13 @@ export function MapToolsPanel({
   onClearRuler,
   onAddAssetOption,
   canEditMap,
+  fogEnabled,
+  fogMode,
+  previewPlayerView,
+  onFogModeChange,
+  onToggleFog,
+  onHideAllFog,
+  onTogglePreviewPlayerView,
 }: Props) {
   const [newAssetId, setNewAssetId] = useState("");
   const [newAssetName, setNewAssetName] = useState("");
@@ -73,6 +88,22 @@ export function MapToolsPanel({
           <option value="clear">Clear</option>
         </select>
       )}
+
+      <div className="divider" />
+      <h3>Fog Workflow</h3>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
+        <button onClick={onToggleFog} disabled={!canEditMap}>{fogEnabled ? "Disable Fog" : "Enable Fog"}</button>
+        <button onClick={onHideAllFog} disabled={!canEditMap}>Hide All</button>
+        <button className={fogMode === "reveal" ? "active-tool" : ""} onClick={() => onFogModeChange("reveal")} disabled={!canEditMap}>
+          Reveal Area
+        </button>
+        <button className={fogMode === "rehide" ? "active-tool" : ""} onClick={() => onFogModeChange("rehide")} disabled={!canEditMap}>
+          Re-hide Area
+        </button>
+      </div>
+      <button style={{ marginTop: 6, width: "100%" }} onClick={onTogglePreviewPlayerView} disabled={!canEditMap}>
+        {previewPlayerView ? "Exit Player Preview" : "Preview Player View"}
+      </button>
 
       {activeTool === "asset" && (
         <>

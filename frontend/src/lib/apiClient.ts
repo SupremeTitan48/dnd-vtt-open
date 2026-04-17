@@ -14,8 +14,15 @@ import type {
   Snapshot,
   Tutorial,
 } from "../types";
+import { getDesktopConfigSync } from "./desktopBridge";
 
-const API_BASE = "/api";
+function getApiBase(): string {
+  const desktopApiBase = getDesktopConfigSync()?.apiBaseUrl;
+  if (desktopApiBase) return desktopApiBase;
+  const envBase = import.meta.env.VITE_API_BASE_URL;
+  if (typeof envBase === "string" && envBase.trim()) return envBase.trim();
+  return "/api";
+}
 export type CommandContext = {
   actor_peer_id?: string;
   actor_token?: string;
@@ -59,7 +66,7 @@ function appendReadContext(path: string, context?: ReadContext): string {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const resp = await fetch(`${API_BASE}${path}`, {
+  const resp = await fetch(`${getApiBase()}${path}`, {
     headers: { "Content-Type": "application/json" },
     ...init,
   });
@@ -190,6 +197,18 @@ export function revealCell(
   command?: CommandContext,
 ): Promise<{ session_id: string; state: Snapshot }> {
   return request(`/sessions/${sessionId}/reveal-cell`, {
+    method: "POST",
+    body: JSON.stringify({ x, y, command }),
+  });
+}
+
+export function hideCell(
+  sessionId: string,
+  x: number,
+  y: number,
+  command?: CommandContext,
+): Promise<{ session_id: string; state: Snapshot }> {
+  return request(`/sessions/${sessionId}/hide-cell`, {
     method: "POST",
     body: JSON.stringify({ x, y, command }),
   });

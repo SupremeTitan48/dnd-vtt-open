@@ -33,6 +33,11 @@ class RevealCellCommand(BaseModel):
     y: int = Field(ge=0)
 
 
+class HideCellCommand(BaseModel):
+    x: int = Field(ge=0)
+    y: int = Field(ge=0)
+
+
 class PaintTerrainCommand(BaseModel):
     x: int = Field(ge=0)
     y: int = Field(ge=0)

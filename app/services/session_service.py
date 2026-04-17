@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import hmac
 import json
 import secrets
 from dataclasses import dataclass, field
@@ -9,6 +10,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from app.backup_import_config import get_backup_import_max_bytes
+from app.backup_signature_config import compute_backup_signature, get_backup_signing_secret
+from app.migrations.runner import run_session_migrations
+from app.migrations.status import CURRENT_SCHEMA_VERSION, MIN_SUPPORTED_SCHEMA_VERSION
+from app.session_store_config import create_session_store
 from app.policies.access_control import PermissionDeniedError, can_access_resource, can_view_gm_secrets, resolve_actor_role
 from content.character_import import import_character_by_format
 from content.tutorial_loader import load_tutorial
@@ -38,7 +44,7 @@ class CommandContext:
 
 @dataclass
 class SessionService:
-    store: SessionStore = field(default_factory=lambda: SessionStore(Path('.sessions')))
+    store: SessionStore = field(default_factory=create_session_store)
     sessions: dict[str, dict[str, Any]] = field(default_factory=dict)
     engines: dict[str, GameStateEngine] = field(default_factory=dict)
     campaigns: dict[str, dict[str, Any]] = field(default_factory=dict)
@@ -125,7 +131,7 @@ class SessionService:
             raise ValueError('Session engine not found')
         snapshot = engine.snapshot()
         snapshot['revision'] = self._current_revision(session_id)
-        snapshot['schema_version'] = 1
+        snapshot['schema_version'] = int(self.sessions.get(session_id, {}).get('schema_version', MIN_SUPPORTED_SCHEMA_VERSION))
         return snapshot
 
     def _prepare_mutation(
@@ -363,6 +369,8 @@ class SessionService:
             'idempotency_results': {},
             'actor_owners': {},
             'peer_tokens': {host_peer_id: secrets.token_urlsafe(24)},
+            'schema_version': CURRENT_SCHEMA_VERSION,
+            'migration_history': [],
         }
         self.engines[session_id] = GameStateEngine(map_state=MapState(width=map_width, height=map_height))
         created = self.sessions[session_id].copy()
@@ -502,6 +510,19 @@ class SessionService:
         if cached is not None:
             return cached
         engine.reveal_cell(x, y)
+        self._increment_revision(session_id)
+        result = self._state_with_revision(session_id)
+        self._cache_result(session_id, command, result)
+        return result
+
+    def hide_cell(self, session_id: str, x: int, y: int, command: CommandContext | None = None) -> dict[str, Any] | None:
+        engine = self.get_engine(session_id)
+        if not engine:
+            return None
+        cached = self._prepare_mutation(session_id, command, resource='map')
+        if cached is not None:
+            return cached
+        engine.hide_cell(x, y)
         self._increment_revision(session_id)
         result = self._state_with_revision(session_id)
         self._cache_result(session_id, command, result)
@@ -1309,6 +1330,8 @@ class SessionService:
 
         self.engines[session_id] = GameStateEngine.from_snapshot(snapshot)
         self.sessions[session_id] = session
+        self.sessions[session_id].setdefault('schema_version', MIN_SUPPORTED_SCHEMA_VERSION)
+        self.sessions[session_id].setdefault('migration_history', [])
         campaign_id = str(session.get('campaign_id', session_id))
         self.campaigns[campaign_id] = campaign
         self._ensure_metadata(session_id)
@@ -1355,6 +1378,26 @@ class SessionService:
                 deleted += 1
         return {'kept': len(to_keep), 'deleted': deleted}
 
+    def prune_backups_by_age(self, session_id: str, max_age_days: int) -> dict[str, int]:
+        backups = self.list_backups(session_id)
+        now = datetime.now(timezone.utc)
+        deleted = 0
+        kept = 0
+        for backup in backups:
+            created_at = str(backup.get('created_at', ''))
+            backup_path = Path(backup['backup_path'])
+            try:
+                created_dt = datetime.fromisoformat(created_at)
+            except ValueError:
+                created_dt = now
+            age_days = (now - created_dt).days
+            if age_days > max_age_days and backup_path.exists():
+                backup_path.unlink()
+                deleted += 1
+            else:
+                kept += 1
+        return {'kept': kept, 'deleted': deleted}
+
     def export_backup(self, session_id: str, backup_id: str) -> dict[str, Any] | None:
         backup_path = self.store.base_dir / 'backups' / f'{backup_id}.json'
         if not backup_path.exists():
@@ -1364,15 +1407,37 @@ class SessionService:
             raise SessionPermissionError('Backup does not match session id')
         canonical = json.dumps(backup, sort_keys=True, separators=(',', ':')).encode('utf-8')
         checksum = hashlib.sha256(canonical).hexdigest()
-        return {'backup': backup, 'checksum_sha256': checksum}
+        exported: dict[str, Any] = {'backup': backup, 'checksum_sha256': checksum}
+        secret = get_backup_signing_secret()
+        if secret:
+            exported['signature_hmac_sha256'] = compute_backup_signature(secret, canonical)
+        return exported
 
-    def import_backup(self, session_id: str, backup: dict[str, Any], checksum_sha256: str) -> dict[str, Any]:
+    def import_backup(
+        self,
+        session_id: str,
+        backup: dict[str, Any],
+        checksum_sha256: str,
+        signature_hmac_sha256: str | None = None,
+    ) -> dict[str, Any]:
         if str(backup.get('session_id')) != session_id:
             raise SessionPermissionError('Backup does not match session id')
         canonical = json.dumps(backup, sort_keys=True, separators=(',', ':')).encode('utf-8')
+        max_import_backup_bytes = get_backup_import_max_bytes()
+        if len(canonical) > max_import_backup_bytes:
+            raise SessionPermissionError(
+                f'Backup import payload too large ({len(canonical)} bytes > {max_import_backup_bytes} bytes)'
+            )
         computed = hashlib.sha256(canonical).hexdigest()
         if computed != checksum_sha256:
             raise SessionPermissionError('Backup checksum mismatch')
+        secret = get_backup_signing_secret()
+        if secret:
+            if not signature_hmac_sha256:
+                raise SessionPermissionError('Backup signature required')
+            expected_signature = compute_backup_signature(secret, canonical)
+            if not hmac.compare_digest(expected_signature, signature_hmac_sha256):
+                raise SessionPermissionError('Backup signature mismatch')
         backup_dir = self.store.base_dir / 'backups'
         backup_dir.mkdir(parents=True, exist_ok=True)
         imported_backup_id = f'{session_id}-{datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")}-{secrets.token_hex(3)}'
@@ -1439,11 +1504,25 @@ class SessionService:
                 'idempotency_results': {},
                 'actor_owners': {},
                 'peer_tokens': {'loaded-host': secrets.token_urlsafe(24)},
+                'schema_version': CURRENT_SCHEMA_VERSION,
+                'migration_history': [],
             }
         else:
             self._ensure_metadata(session_id)
+            self.sessions[session_id].setdefault('schema_version', MIN_SUPPORTED_SCHEMA_VERSION)
+            self.sessions[session_id].setdefault('migration_history', [])
         self._ensure_campaign(str(self.sessions[session_id].get('campaign_id', session_id)))
         return engine.snapshot()
+
+    def migrate_session(self, session_id: str, *, dry_run: bool) -> dict[str, Any] | None:
+        session = self.sessions.get(session_id)
+        if session is None:
+            return None
+        self._ensure_metadata(session_id)
+        result = run_session_migrations(session, dry_run=dry_run)
+        result['session_id'] = session_id
+        result['dry_run'] = dry_run
+        return result
 
     def get_tutorial(self, tutorial_path: str = 'packs/starter/tutorials/dm_tutorial_map.json') -> dict[str, Any]:
         tutorial = load_tutorial(tutorial_path)

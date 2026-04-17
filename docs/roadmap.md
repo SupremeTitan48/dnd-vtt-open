@@ -63,3 +63,5 @@ This file tracks practical implementation status against the architecture roadma
   - Session backup/restore; list/prune; portable export/import with SHA-256 verification; GM/AssistantGM gates on backup APIs.
   - Backup audit trail (`/api/sessions/{id}/backups/audit`) and configurable in-memory rate limits (`DND_VTT_BACKUP_RATE_LIMIT_*`).
   - Self-hosted operations runbook (`docs/operations.md`) including health, backup workflows, rate-limit env vars, and deployment notes.
+  - Configurable session snapshot backend (`DND_VTT_SESSION_STORE_BACKEND=json|sqlite`) with SQLite durability option.
+  - Migration rollout/rollback playbook (`docs/migration-playbook.md`) and deployment templates under `deploy/`.
