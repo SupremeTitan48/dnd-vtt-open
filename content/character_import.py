@@ -5,7 +5,7 @@ import io
 import json
 from typing import Optional
 
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, model_validator
 
 
 class CharacterSheet(BaseModel):
@@ -14,6 +14,22 @@ class CharacterSheet(BaseModel):
     level: int = Field(ge=1)
     hit_points: int = Field(ge=1)
     items: list[str] = []
+    saves: dict[str, int] = {}
+    skills: dict[str, dict[str, int | str]] = {}
+    armor_class: int = Field(default=10, ge=0)
+    max_hit_points: int = Field(default=1, ge=1)
+    current_hit_points: int = Field(default=1, ge=0)
+    concentration: bool = False
+    spell_slots: dict[str, dict[str, int]] = {}
+
+    @model_validator(mode="after")
+    def sync_hp_fields(self) -> "CharacterSheet":
+        if self.max_hit_points <= 1:
+            self.max_hit_points = self.hit_points
+        if self.current_hit_points <= 1:
+            self.current_hit_points = self.hit_points
+        self.current_hit_points = max(0, min(self.current_hit_points, self.max_hit_points))
+        return self
 
 
 def normalize_character(data: dict) -> CharacterSheet:

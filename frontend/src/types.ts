@@ -92,12 +92,35 @@ export type Plugin = {
   created_at: string;
 };
 
+export type ModulePack = {
+  module_id: string;
+  name: string;
+  version: string;
+  description?: string;
+  checksum_sha256: string;
+  enabled: boolean;
+  installed_at: string;
+  updated_at: string;
+};
+
 export type CharacterSheet = {
+  actor_id?: string;
   name: string;
   character_class: string;
   level: number;
   hit_points: number;
   items: string[];
+  saves?: Record<string, number>;
+  abilities?: Record<string, number>;
+  skills?: Record<string, { modifier: number; proficiency: "none" | "half_proficient" | "proficient" | "expertise" | "expert" | number }>;
+  attacks?: Record<string, { modifier: number }>;
+  spells?: Record<string, { modifier: number }>;
+  armor_class?: number;
+  max_hit_points?: number;
+  current_hit_points?: number;
+  concentration?: boolean;
+  spell_slots?: Record<string, { max: number; current: number }>;
+  inventory?: string[];
 };
 
 export type EncounterTemplate = {
@@ -119,6 +142,12 @@ export type Snapshot = {
     asset_stamps: Record<string, string>;
     visibility_cells_by_token?: Record<string, [number, number][]>;
     vision_radius_by_token?: Record<string, number>;
+    vision_mode_by_token?: Record<string, "normal" | "darkvision" | "truesight">;
+    token_light_by_token?: Record<
+      string,
+      { bright_radius: number; dim_radius: number; color: string; enabled: boolean }
+    >;
+    scene_lighting_preset?: "day" | "dim" | "night";
   };
   combat: {
     initiative_order: string[];
@@ -142,4 +171,14 @@ export type SessionEvent = {
   revision?: number;
   timestamp: string;
   payload: Record<string, unknown>;
+};
+
+export type ChatMessage = {
+  message_id: string;
+  sender_peer_id?: string;
+  kind: "ic" | "ooc" | "emote" | "system" | "whisper" | "roll";
+  content?: string;
+  visibility_mode: "public" | "private" | "gm_only";
+  whisper_targets?: string[];
+  revision?: number;
 };

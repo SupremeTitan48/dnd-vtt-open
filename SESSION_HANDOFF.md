@@ -4,6 +4,21 @@ This file captures implementation progress so a fresh chat can continue without 
 
 ## Current Status (Latest)
 
+- Competitive-gap closure plan slices 1-4 are implemented in worktree `.worktrees/next-agent-vtt-gap-closure` on branch `next-agent-vtt-gap-closure`.
+- Delivered in this pass:
+  - Slice 1: sheet-driven D&D character actions (server-authoritative roll construction, ownership-safe sheet UI/controls).
+  - Slice 2: lighting/vision depth (token lights, scene lighting presets, vision mode support, permission-safe replay behavior).
+  - Slice 3: rich chat semantics (`/me`, `/ooc`, whispers, private rolls) with redaction-safe replay/websocket filtering.
+  - Slice 4: installable module/pack lifecycle (manifest contracts, install/list/enable/disable APIs, frontend Extensions manager, integrity checks).
+- Security and correctness hardening completed during slices:
+  - chat idempotency scoped by caller identity to prevent cross-peer payload reuse leaks,
+  - non-privileged session views redact sensitive token metadata (`peer_tokens`) and idempotency caches,
+  - module install rejects idempotency-key reuse with changed payload.
+- Full verification in this worktree passed:
+  - `python3 -m pytest -q`
+  - `npm --prefix frontend test`
+  - `npm --prefix frontend run build`
+
 - Phase 1 (chat, dice, presence, pings, GM feature flags) is implemented in worktree `feature/phase1-heartbeat` at `.worktrees/phase1-heartbeat`.
 - Full verification in worktree passed:
   - `python3 -m pytest -q`

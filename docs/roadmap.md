@@ -65,3 +65,19 @@ This file tracks practical implementation status against the architecture roadma
   - Self-hosted operations runbook (`docs/operations.md`) including health, backup workflows, rate-limit env vars, and deployment notes.
   - Configurable session snapshot backend (`DND_VTT_SESSION_STORE_BACKEND=json|sqlite`) with SQLite durability option.
   - Migration rollout/rollback playbook (`docs/migration-playbook.md`) and deployment templates under `deploy/`.
+
+## Competitive Gap Closure Slices (latest delivery)
+- Status: slices 1-4 complete in `next-agent-vtt-gap-closure`.
+- Delivered:
+  - Slice 1 (character experience): sheet-driven action flow with server-side roll formula construction, advantage/disadvantage + visibility controls, and ownership-safe redaction.
+  - Slice 2 (lighting/vision): token light sources, scene lighting presets, vision mode controls, GM map tooling, and replay/event permission filtering.
+  - Slice 3 (rich chat): `/me`, `/ooc`, whispers, private roll chat semantics, visibility badges, and websocket/replay redaction guarantees.
+  - Slice 4 (module ecosystem): installable pack manifest/contracts, install/list/enable/disable APIs, campaign/session module persistence, and frontend Extensions manager UI.
+- Hardening included:
+  - chat idempotency isolation by caller identity,
+  - stricter session-view redaction of sensitive token metadata,
+  - module install integrity parity (canonical checksum/signature verification across frontend/backend).
+- Verification:
+  - `python3 -m pytest -q` passed.
+  - `npm --prefix frontend test` passed.
+  - `npm --prefix frontend run build` passed.

@@ -447,6 +447,55 @@ def test_token_vision_updates_emit_single_event_on_idempotent_replay() -> None:
     assert len(vision_events) == 1
 
 
+def test_token_light_events_are_filtered_by_token_ownership() -> None:
+    client = TestClient(app)
+    created = client.post('/api/sessions', json={"session_name": "TokenLightOwnershipEvents", "host_peer_id": "dm"})
+    session_id = created.json()['session_id']
+
+    join_p1 = client.post(f"/api/sessions/{session_id}/join", json={"peer_id": "p1"})
+    join_p2 = client.post(f"/api/sessions/{session_id}/join", json={"peer_id": "p2"})
+    assert join_p1.status_code == 200
+    assert join_p2.status_code == 200
+    p1_token = join_p1.json()['peer_token']
+    p2_token = join_p2.json()['peer_token']
+
+    hero = client.post(f"/api/sessions/{session_id}/move-token", json={"token_id": "hero", "x": 2, "y": 2})
+    assert hero.status_code == 200
+    owner = client.post(
+        f"/api/sessions/{session_id}/actor-ownership",
+        json={"actor_id": "hero", "peer_id": "p1", "command": {"expected_revision": 1}},
+    )
+    assert owner.status_code == 200
+
+    set_light = client.post(
+        f"/api/sessions/{session_id}/token-light",
+        json={
+            "token_id": "hero",
+            "bright_radius": 3,
+            "dim_radius": 6,
+            "color": "#ffddaa",
+            "enabled": True,
+            "command": {"expected_revision": 2},
+        },
+    )
+    assert set_light.status_code == 200
+
+    replay_p1 = client.get(
+        f"/api/sessions/{session_id}/events/replay",
+        params={"after_revision": 2, "actor_peer_id": "p1", "actor_token": p1_token},
+    )
+    replay_p2 = client.get(
+        f"/api/sessions/{session_id}/events/replay",
+        params={"after_revision": 2, "actor_peer_id": "p2", "actor_token": p2_token},
+    )
+    assert replay_p1.status_code == 200
+    assert replay_p2.status_code == 200
+    p1_event = next(event for event in replay_p1.json()['events'] if event.get('event_type') == 'token_light_updated')
+    p2_event = next(event for event in replay_p2.json()['events'] if event.get('event_type') == 'token_light_updated')
+    assert p1_event['payload'].get('token_id') == 'hero'
+    assert p2_event['payload'] == {}
+
+
 def test_event_replay_requires_actor_peer_id() -> None:
     client = TestClient(app)
     created = client.post('/api/sessions', json={"session_name": "ReplayAuth", "host_peer_id": "dm"})
@@ -477,3 +526,158 @@ def test_websocket_subscription_requires_actor_peer_id() -> None:
         with client.websocket_connect(f'/api/sessions/{session_id}/events') as ws:
             ws.send_text('subscribe')
             ws.receive_text()
+
+
+def test_chat_message_visibility_redaction_for_private_and_whisper() -> None:
+    client = TestClient(app)
+    created = client.post('/api/sessions', json={"session_name": "ChatVisibility", "host_peer_id": "dm"})
+    session_id = created.json()['session_id']
+    host_token = created.json()['host_peer_token']
+    host_command = {"actor_peer_id": "dm", "actor_token": host_token}
+
+    owner = client.post(f"/api/sessions/{session_id}/join", json={"peer_id": "owner"})
+    other = client.post(f"/api/sessions/{session_id}/join", json={"peer_id": "other"})
+    assert owner.status_code == 200
+    assert other.status_code == 200
+    owner_token = owner.json()['peer_token']
+    other_token = other.json()['peer_token']
+
+    private_msg = client.post(
+        f"/api/sessions/{session_id}/chat/messages",
+        json={
+            "content": "secret plan",
+            "kind": "ooc",
+            "visibility_mode": "private",
+            "whisper_targets": [],
+            "command": {"actor_peer_id": "owner", "actor_token": owner_token, "expected_revision": 0},
+        },
+    )
+    whisper_msg = client.post(
+        f"/api/sessions/{session_id}/chat/messages",
+        json={
+            "content": "psst",
+            "kind": "whisper",
+            "visibility_mode": "public",
+            "whisper_targets": ["owner"],
+            "command": host_command | {"expected_revision": 1},
+        },
+    )
+    assert private_msg.status_code == 200
+    assert whisper_msg.status_code == 200
+
+    replay_other = client.get(
+        f"/api/sessions/{session_id}/events/replay",
+        params={"after_revision": 0, "actor_peer_id": "other", "actor_token": other_token},
+    )
+    assert replay_other.status_code == 200
+    chat_events = [event for event in replay_other.json()['events'] if event.get('event_type') == 'chat_message']
+    assert len(chat_events) == 2
+    assert chat_events[0]['payload'].get('content') is None
+    assert chat_events[1]['payload'].get('content') is None
+
+
+def test_chat_message_websocket_redaction_for_private_and_whisper() -> None:
+    client = TestClient(app)
+    created = client.post('/api/sessions', json={"session_name": "ChatWsVisibility", "host_peer_id": "dm"})
+    session_id = created.json()['session_id']
+    host_token = created.json()['host_peer_token']
+    host_command = {"actor_peer_id": "dm", "actor_token": host_token}
+
+    owner = client.post(f"/api/sessions/{session_id}/join", json={"peer_id": "owner"})
+    other = client.post(f"/api/sessions/{session_id}/join", json={"peer_id": "other"})
+    assert owner.status_code == 200
+    assert other.status_code == 200
+    owner_token = owner.json()['peer_token']
+    other_token = other.json()['peer_token']
+
+    with client.websocket_connect(f"/api/sessions/{session_id}/events?actor_peer_id=other&actor_token={other_token}") as ws:
+        ws.send_text('subscribe')
+        private_msg = client.post(
+            f"/api/sessions/{session_id}/chat/messages",
+            json={
+                "content": "owner secret",
+                "kind": "ooc",
+                "visibility_mode": "private",
+                "whisper_targets": [],
+                "command": {"actor_peer_id": "owner", "actor_token": owner_token, "expected_revision": 0},
+            },
+        )
+        whisper_msg = client.post(
+            f"/api/sessions/{session_id}/chat/messages",
+            json={
+                "content": "dm whisper",
+                "kind": "whisper",
+                "visibility_mode": "public",
+                "whisper_targets": ["owner"],
+                "command": host_command | {"expected_revision": 1},
+            },
+        )
+        assert private_msg.status_code == 200
+        assert whisper_msg.status_code == 200
+
+        first = json.loads(ws.receive_text())
+        second = json.loads(ws.receive_text())
+        events = [first, second]
+        chat_events = [event for event in events if event.get('event_type') == 'chat_message']
+        assert len(chat_events) == 2
+        for event in chat_events:
+            assert event['payload'].get('content') is None
+            assert event['payload'].get('kind') in {'ooc', 'whisper'}
+
+
+def test_chat_idempotency_is_scoped_by_caller_identity() -> None:
+    client = TestClient(app)
+    created = client.post('/api/sessions', json={"session_name": "ChatIdempotencyScope", "host_peer_id": "dm"})
+    session_id = created.json()['session_id']
+    host_token = created.json()['host_peer_token']
+    host_command = {"actor_peer_id": "dm", "actor_token": host_token}
+    owner = client.post(f"/api/sessions/{session_id}/join", json={"peer_id": "owner"})
+    assert owner.status_code == 200
+    owner_token = owner.json()['peer_token']
+
+    first = client.post(
+        f"/api/sessions/{session_id}/chat/messages",
+        json={
+            "content": "dm says hi",
+            "kind": "ooc",
+            "visibility_mode": "public",
+            "whisper_targets": [],
+            "command": host_command | {"expected_revision": 0, "idempotency_key": "chat-key"},
+        },
+    )
+    second_other_peer = client.post(
+        f"/api/sessions/{session_id}/chat/messages",
+        json={
+            "content": "owner says hi",
+            "kind": "ooc",
+            "visibility_mode": "public",
+            "whisper_targets": [],
+            "command": {"actor_peer_id": "owner", "actor_token": owner_token, "expected_revision": 1, "idempotency_key": "chat-key"},
+        },
+    )
+    duplicate_same_peer = client.post(
+        f"/api/sessions/{session_id}/chat/messages",
+        json={
+            "content": "dm ignored duplicate",
+            "kind": "ooc",
+            "visibility_mode": "public",
+            "whisper_targets": [],
+            "command": host_command | {"expected_revision": 2, "idempotency_key": "chat-key"},
+        },
+    )
+    assert first.status_code == 200
+    assert second_other_peer.status_code == 200
+    assert duplicate_same_peer.status_code == 200
+    assert first.json()['revision'] == 1
+    assert second_other_peer.json()['revision'] == 2
+    assert duplicate_same_peer.json()['revision'] == 1
+    assert duplicate_same_peer.json()['message_id'] == first.json()['message_id']
+
+    replay = client.get(
+        f"/api/sessions/{session_id}/events/replay",
+        params={"after_revision": 0, "actor_peer_id": "dm", "actor_token": host_token},
+    )
+    assert replay.status_code == 200
+    chat_events = [event for event in replay.json()['events'] if event.get('event_type') == 'chat_message']
+    assert len(chat_events) == 2
+    assert {event['payload'].get('sender_peer_id') for event in chat_events} == {"dm", "owner"}

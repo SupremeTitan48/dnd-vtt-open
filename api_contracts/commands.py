@@ -1,6 +1,25 @@
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from typing import Literal
+
+from pydantic import BaseModel, Field, field_validator
+
+PROFICIENCY_TIERS = {'none', 'half_proficient', 'proficient', 'expertise', 'expert'}
+
+
+class SkillTierValue(BaseModel):
+    modifier: int = 0
+    proficiency: str | int | float = 'none'
+
+    @field_validator('proficiency')
+    @classmethod
+    def validate_proficiency(cls, value: str | int | float) -> str | int | float:
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized not in PROFICIENCY_TIERS:
+                raise ValueError(f'proficiency must be one of {sorted(PROFICIENCY_TIERS)} or numeric')
+            return normalized
+        return value
 
 
 class MoveTokenCommand(BaseModel):
@@ -22,6 +41,30 @@ class UpdateActorCommand(BaseModel):
     hit_points: int | None = Field(default=None, ge=0)
     add_item: str | None = None
     add_condition: str | None = None
+    armor_class: int | None = Field(default=None, ge=0)
+    max_hit_points: int | None = Field(default=None, ge=0)
+    current_hit_points: int | None = Field(default=None, ge=0)
+    concentration: bool | None = None
+    saves: dict[str, int] | None = None
+    skills: dict[str, SkillTierValue] | None = None
+    spell_slots: dict[str, dict[str, int]] | None = None
+    inventory_add: str | None = None
+    inventory_remove: str | None = None
+
+
+class SheetActionRollCommand(BaseModel):
+    actor_id: str = Field(min_length=1)
+    action_type: Literal["ability", "save", "skill", "attack", "spell"] = "ability"
+    action_key: str = Field(min_length=1)
+    advantage_mode: Literal["normal", "advantage", "disadvantage"] = "normal"
+    visibility_mode: Literal["public", "private", "gm_only"] = "public"
+
+
+class SendChatMessageCommand(BaseModel):
+    content: str = Field(min_length=1, max_length=2000)
+    kind: Literal["ic", "ooc", "emote", "system", "whisper", "roll"] = "ic"
+    visibility_mode: Literal["public", "private", "gm_only"] = "public"
+    whisper_targets: list[str] = Field(default_factory=list)
 
 
 class SetFogCommand(BaseModel):
@@ -63,6 +106,18 @@ class RecomputeVisibilityCommand(BaseModel):
 class SetTokenVisionRadiusCommand(BaseModel):
     token_id: str = Field(min_length=1)
     radius: int = Field(ge=0)
+
+
+class SetTokenLightCommand(BaseModel):
+    token_id: str = Field(min_length=1)
+    bright_radius: int = Field(ge=0)
+    dim_radius: int = Field(ge=0)
+    color: str = Field(min_length=1)
+    enabled: bool
+
+
+class SetSceneLightingCommand(BaseModel):
+    preset: str = Field(min_length=1)
 
 
 class ImportCharacterCommand(BaseModel):

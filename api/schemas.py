@@ -1,8 +1,25 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator
+
+PROFICIENCY_TIERS = {'none', 'half_proficient', 'proficient', 'expertise', 'expert'}
+
+
+class SkillTierValue(BaseModel):
+    modifier: int = 0
+    proficiency: str | int | float = 'none'
+
+    @field_validator('proficiency')
+    @classmethod
+    def validate_proficiency(cls, value: str | int | float) -> str | int | float:
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized not in PROFICIENCY_TIERS:
+                raise ValueError(f'proficiency must be one of {sorted(PROFICIENCY_TIERS)} or numeric')
+            return normalized
+        return value
 
 
 class CommandContextRequest(BaseModel):
@@ -58,6 +75,32 @@ class ActorStateRequest(BaseModel):
     hit_points: Optional[int] = Field(default=None, ge=0)
     add_item: Optional[str] = None
     add_condition: Optional[str] = None
+    armor_class: Optional[int] = Field(default=None, ge=0)
+    max_hit_points: Optional[int] = Field(default=None, ge=0)
+    current_hit_points: Optional[int] = Field(default=None, ge=0)
+    concentration: Optional[bool] = None
+    saves: Optional[Dict[str, int]] = None
+    skills: Optional[Dict[str, SkillTierValue]] = None
+    spell_slots: Optional[Dict[str, Dict[str, int]]] = None
+    inventory_add: Optional[str] = None
+    inventory_remove: Optional[str] = None
+    command: Optional[CommandContextRequest] = None
+
+
+class SheetActionRollRequest(BaseModel):
+    actor_id: str = Field(min_length=1)
+    action_type: Literal["ability", "save", "skill", "attack", "spell"] = "ability"
+    action_key: str = Field(min_length=1)
+    advantage_mode: Literal["normal", "advantage", "disadvantage"] = "normal"
+    visibility_mode: Literal["public", "private", "gm_only"] = "public"
+    command: Optional[CommandContextRequest] = None
+
+
+class ChatMessageRequest(BaseModel):
+    content: str = Field(min_length=1, max_length=2000)
+    kind: Literal["ic", "ooc", "emote", "system", "whisper", "roll"] = "ic"
+    visibility_mode: Literal["public", "private", "gm_only"] = "public"
+    whisper_targets: List[str] = Field(default_factory=list)
     command: Optional[CommandContextRequest] = None
 
 
@@ -119,6 +162,20 @@ class RecomputeVisibilityRequest(BaseModel):
 class TokenVisionRequest(BaseModel):
     token_id: str = Field(min_length=1)
     radius: int = Field(ge=0)
+    command: Optional[CommandContextRequest] = None
+
+
+class TokenLightRequest(BaseModel):
+    token_id: str = Field(min_length=1)
+    bright_radius: int = Field(ge=0)
+    dim_radius: int = Field(ge=0)
+    color: str = Field(min_length=1)
+    enabled: bool
+    command: Optional[CommandContextRequest] = None
+
+
+class SceneLightingRequest(BaseModel):
+    preset: str = Field(min_length=1)
     command: Optional[CommandContextRequest] = None
 
 
@@ -256,4 +313,21 @@ class BackupRequest(BaseModel):
 
 class MigrateSessionRequest(BaseModel):
     dry_run: bool = False
+    command: Optional[CommandContextRequest] = None
+
+
+class PackPluginMetadataRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    version: str = Field(min_length=1, max_length=40)
+    capabilities: List[str] = Field(default_factory=list, max_length=32)
+
+
+class InstallPackRequest(BaseModel):
+    manifest: Dict[str, Any]
+    checksum_sha256: str = Field(min_length=64, max_length=64)
+    signature_hmac_sha256: Optional[str] = Field(default=None, min_length=64, max_length=64)
+    command: Optional[CommandContextRequest] = None
+
+
+class ToggleModuleRequest(BaseModel):
     command: Optional[CommandContextRequest] = None

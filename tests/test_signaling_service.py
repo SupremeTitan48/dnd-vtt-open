@@ -328,6 +328,60 @@ def test_non_gm_read_visibility_filters_gm_secret_data() -> None:
     assert player_session.json().get('notes') == ''
     assert player_session.json().get('encounter_templates') == []
     assert 'peer_roles' not in player_session.json()
+    assert 'peer_tokens' not in player_session.json()
+    assert 'idempotency_results' not in player_session.json()
+    assert 'chat_idempotency_results' not in player_session.json()
+
+
+def test_observer_session_view_does_not_include_peer_tokens() -> None:
+    client = TestClient(app)
+    created = client.post('/api/sessions', json={"session_name": "ObserverTokenRedaction", "host_peer_id": "dm"})
+    session_id = created.json()['session_id']
+
+    joined = client.post(f"/api/sessions/{session_id}/join", json={"peer_id": "obs"})
+    assert joined.status_code == 200
+    obs_token = joined.json()['peer_token']
+
+    set_role = client.post(
+        f'/api/sessions/{session_id}/roles',
+        json={"peer_id": "obs", "role": "Observer", "command": {"expected_revision": 0}},
+    )
+    assert set_role.status_code == 200
+
+    observer_session = client.get(f'/api/sessions/{session_id}', params={"actor_peer_id": "obs", "actor_token": obs_token})
+    assert observer_session.status_code == 200
+    assert 'peer_tokens' not in observer_session.json()
+
+
+def test_session_output_never_exposes_chat_idempotency_metadata() -> None:
+    client = TestClient(app)
+    created = client.post('/api/sessions', json={"session_name": "ChatIdempotencyMetadata", "host_peer_id": "dm"})
+    session_id = created.json()['session_id']
+    host_token = created.json()['host_peer_token']
+    host_command = {"actor_peer_id": "dm", "actor_token": host_token}
+
+    joined = client.post(f"/api/sessions/{session_id}/join", json={"peer_id": "p1"})
+    assert joined.status_code == 200
+    p1_token = joined.json()['peer_token']
+
+    sent = client.post(
+        f"/api/sessions/{session_id}/chat/messages",
+        json={
+            "content": "cached chat",
+            "kind": "ooc",
+            "visibility_mode": "public",
+            "whisper_targets": [],
+            "command": host_command | {"expected_revision": 0, "idempotency_key": "chat-meta-key"},
+        },
+    )
+    assert sent.status_code == 200
+
+    gm_session = client.get(f'/api/sessions/{session_id}', params={"actor_peer_id": "dm", "actor_token": host_token})
+    player_session = client.get(f'/api/sessions/{session_id}', params={"actor_peer_id": "p1", "actor_token": p1_token})
+    assert gm_session.status_code == 200
+    assert player_session.status_code == 200
+    assert 'chat_idempotency_results' not in gm_session.json()
+    assert 'chat_idempotency_results' not in player_session.json()
 
 
 def test_player_state_only_includes_owned_actors() -> None:
@@ -1891,3 +1945,346 @@ def test_phase4_plugin_executor_exceptions_are_isolated() -> None:
         params={"actor_peer_id": "dm", "actor_token": host_token},
     )
     assert state_still_works.status_code == 200
+
+
+def test_sheet_roll_private_visibility_redacts_for_non_owners() -> None:
+    client = TestClient(app)
+    created = client.post('/api/sessions', json={"session_name": "SheetRollRedaction", "host_peer_id": "dm"})
+    session_id = created.json()['session_id']
+    host_token = created.json()['host_peer_token']
+    host_command = {"actor_peer_id": "dm", "actor_token": host_token}
+
+    joined = client.post(f"/api/sessions/{session_id}/join", json={"peer_id": "p1"})
+    assert joined.status_code == 200
+    p1_token = joined.json()['peer_token']
+
+    imported = client.post(
+        f"/api/sessions/{session_id}/characters/import",
+        json={
+            "import_format": "json_schema",
+            "payload": '{"name":"Hero","character_class":"Fighter","level":3,"hit_points":20,"items":[]}',
+            "token_id": "hero",
+            "command": host_command,
+        },
+    )
+    assert imported.status_code == 200
+
+    rolled = client.post(
+        f"/api/sessions/{session_id}/sheet-actions/roll",
+        json={
+            "actor_id": "hero",
+            "action_type": "ability",
+            "action_key": "str",
+            "advantage_mode": "normal",
+            "visibility_mode": "private",
+            "command": host_command,
+        },
+    )
+    assert rolled.status_code == 200
+
+    replay = client.get(
+        f"/api/sessions/{session_id}/events/replay",
+        params={"after_revision": 0, "actor_peer_id": "p1", "actor_token": p1_token},
+    )
+    assert replay.status_code == 200
+    events = [event for event in replay.json()['events'] if event.get('event_type') == 'sheet_action_rolled']
+    assert len(events) == 1
+    assert events[0]['payload'].get('formula') is None
+
+
+def test_character_payload_exposes_canonical_actor_id() -> None:
+    client = TestClient(app)
+    created = client.post('/api/sessions', json={"session_name": "CanonicalActorId", "host_peer_id": "dm"})
+    session_id = created.json()['session_id']
+    host_token = created.json()['host_peer_token']
+    host_command = {"actor_peer_id": "dm", "actor_token": host_token}
+
+    imported = client.post(
+        f"/api/sessions/{session_id}/characters/import",
+        json={
+            "import_format": "json_schema",
+            "payload": '{"name":"Hero","character_class":"Fighter","level":3,"hit_points":20,"items":[]}',
+            "token_id": "hero-main-token",
+            "command": host_command,
+        },
+    )
+    assert imported.status_code == 200
+
+    listed = client.get(
+        f"/api/sessions/{session_id}/characters",
+        params={"actor_peer_id": "dm", "actor_token": host_token},
+    )
+    assert listed.status_code == 200
+    assert listed.json()['characters'][0]['actor_id'] == "hero-main-token"
+
+
+def test_sheet_roll_response_visibility_for_gm_owner_non_owner() -> None:
+    client = TestClient(app)
+    created = client.post('/api/sessions', json={"session_name": "SheetRollImmediateRedaction", "host_peer_id": "dm"})
+    session_id = created.json()['session_id']
+    host_token = created.json()['host_peer_token']
+    host_command = {"actor_peer_id": "dm", "actor_token": host_token}
+
+    join_owner = client.post(f"/api/sessions/{session_id}/join", json={"peer_id": "p_owner"})
+    join_other = client.post(f"/api/sessions/{session_id}/join", json={"peer_id": "p_other"})
+    assert join_owner.status_code == 200
+    assert join_other.status_code == 200
+    owner_token = join_owner.json()['peer_token']
+    other_token = join_other.json()['peer_token']
+
+    imported = client.post(
+        f"/api/sessions/{session_id}/characters/import",
+        json={
+            "import_format": "json_schema",
+            "payload": '{"name":"Hero","character_class":"Fighter","level":3,"hit_points":20,"items":[]}',
+            "token_id": "hero",
+            "command": host_command,
+        },
+    )
+    assert imported.status_code == 200
+    assigned = client.post(
+        f"/api/sessions/{session_id}/actor-ownership",
+        json={"actor_id": "hero", "peer_id": "p_owner", "command": {"actor_peer_id": "dm", "actor_token": host_token, "expected_revision": 1}},
+    )
+    assert assigned.status_code == 200
+
+    gm_only_gm = client.post(
+        f"/api/sessions/{session_id}/sheet-actions/roll",
+        json={
+            "actor_id": "hero",
+            "action_type": "ability",
+            "action_key": "str",
+            "advantage_mode": "normal",
+            "visibility_mode": "gm_only",
+            "command": host_command,
+        },
+    )
+    assert gm_only_gm.status_code == 200
+    assert gm_only_gm.json().get('formula')
+
+    gm_only_owner = client.post(
+        f"/api/sessions/{session_id}/sheet-actions/roll",
+        json={
+            "actor_id": "hero",
+            "action_type": "ability",
+            "action_key": "str",
+            "advantage_mode": "normal",
+            "visibility_mode": "gm_only",
+            "command": {"actor_peer_id": "p_owner", "actor_token": owner_token, "expected_revision": gm_only_gm.json()['revision']},
+        },
+    )
+    assert gm_only_owner.status_code == 200
+    assert gm_only_owner.json().get('formula') is None
+
+    private_owner = client.post(
+        f"/api/sessions/{session_id}/sheet-actions/roll",
+        json={
+            "actor_id": "hero",
+            "action_type": "ability",
+            "action_key": "str",
+            "advantage_mode": "normal",
+            "visibility_mode": "private",
+            "command": {"actor_peer_id": "p_owner", "actor_token": owner_token, "expected_revision": gm_only_owner.json()['revision']},
+        },
+    )
+    assert private_owner.status_code == 200
+    assert private_owner.json().get('formula')
+
+    private_non_owner = client.post(
+        f"/api/sessions/{session_id}/sheet-actions/roll",
+        json={
+            "actor_id": "hero",
+            "action_type": "ability",
+            "action_key": "str",
+            "advantage_mode": "normal",
+            "visibility_mode": "private",
+            "command": {"actor_peer_id": "p_other", "actor_token": other_token, "expected_revision": private_owner.json()['revision']},
+        },
+    )
+    assert private_non_owner.status_code == 403
+
+
+def test_sheet_roll_event_replay_preserves_authoritative_gm_only_payload() -> None:
+    client = TestClient(app)
+    created = client.post('/api/sessions', json={"session_name": "SheetRollReplayAuthoritative", "host_peer_id": "dm"})
+    session_id = created.json()['session_id']
+    host_token = created.json()['host_peer_token']
+    host_command = {"actor_peer_id": "dm", "actor_token": host_token}
+
+    joined_owner = client.post(f"/api/sessions/{session_id}/join", json={"peer_id": "owner"})
+    assert joined_owner.status_code == 200
+    owner_token = joined_owner.json()['peer_token']
+
+    imported = client.post(
+        f"/api/sessions/{session_id}/characters/import",
+        json={
+            "import_format": "json_schema",
+            "payload": '{"name":"Hero","character_class":"Fighter","level":3,"hit_points":20,"items":[]}',
+            "token_id": "hero",
+            "command": host_command,
+        },
+    )
+    assert imported.status_code == 200
+    ownership = client.post(
+        f"/api/sessions/{session_id}/actor-ownership",
+        json={"actor_id": "hero", "peer_id": "owner", "command": {"actor_peer_id": "dm", "actor_token": host_token, "expected_revision": 1}},
+    )
+    assert ownership.status_code == 200
+
+    rolled = client.post(
+        f"/api/sessions/{session_id}/sheet-actions/roll",
+        json={
+            "actor_id": "hero",
+            "action_type": "ability",
+            "action_key": "str",
+            "advantage_mode": "normal",
+            "visibility_mode": "gm_only",
+            "command": {"actor_peer_id": "owner", "actor_token": owner_token, "expected_revision": 2},
+        },
+    )
+    assert rolled.status_code == 200
+    assert rolled.json().get('formula') is None
+    assert rolled.json().get('total') is None
+
+    replay = client.get(
+        f"/api/sessions/{session_id}/events/replay",
+        params={"after_revision": 0, "actor_peer_id": "dm", "actor_token": host_token},
+    )
+    assert replay.status_code == 200
+    events = [event for event in replay.json()['events'] if event.get('event_type') == 'sheet_action_rolled']
+    assert len(events) == 1
+    assert isinstance(events[0]['payload'].get('formula'), str)
+    assert isinstance(events[0]['payload'].get('total'), int)
+
+
+def test_sheet_roll_idempotency_is_filtered_per_caller_identity() -> None:
+    client = TestClient(app)
+    created = client.post('/api/sessions', json={"session_name": "SheetRollIdempotencyIdentity", "host_peer_id": "dm"})
+    session_id = created.json()['session_id']
+    host_token = created.json()['host_peer_token']
+    host_command = {"actor_peer_id": "dm", "actor_token": host_token}
+
+    joined_owner = client.post(f"/api/sessions/{session_id}/join", json={"peer_id": "owner"})
+    assert joined_owner.status_code == 200
+    owner_token = joined_owner.json()['peer_token']
+
+    imported = client.post(
+        f"/api/sessions/{session_id}/characters/import",
+        json={
+            "import_format": "json_schema",
+            "payload": '{"name":"Hero","character_class":"Fighter","level":3,"hit_points":20,"items":[]}',
+            "token_id": "hero",
+            "command": host_command,
+        },
+    )
+    assert imported.status_code == 200
+    ownership = client.post(
+        f"/api/sessions/{session_id}/actor-ownership",
+        json={"actor_id": "hero", "peer_id": "owner", "command": {"actor_peer_id": "dm", "actor_token": host_token, "expected_revision": 1}},
+    )
+    assert ownership.status_code == 200
+
+    gm_roll = client.post(
+        f"/api/sessions/{session_id}/sheet-actions/roll",
+        json={
+            "actor_id": "hero",
+            "action_type": "ability",
+            "action_key": "str",
+            "advantage_mode": "normal",
+            "visibility_mode": "gm_only",
+            "command": {"actor_peer_id": "dm", "actor_token": host_token, "expected_revision": 2, "idempotency_key": "shared-roll"},
+        },
+    )
+    assert gm_roll.status_code == 200
+    assert isinstance(gm_roll.json().get("formula"), str)
+
+    owner_same_key = client.post(
+        f"/api/sessions/{session_id}/sheet-actions/roll",
+        json={
+            "actor_id": "hero",
+            "action_type": "ability",
+            "action_key": "str",
+            "advantage_mode": "normal",
+            "visibility_mode": "gm_only",
+            "command": {"actor_peer_id": "owner", "actor_token": owner_token, "expected_revision": 3, "idempotency_key": "shared-roll"},
+        },
+    )
+    assert owner_same_key.status_code == 200
+    assert owner_same_key.json().get("formula") is None
+    assert owner_same_key.json().get("total") is None
+
+
+def test_sheet_roll_replay_payload_matches_immediate_roll_shape_for_gm() -> None:
+    client = TestClient(app)
+    created = client.post('/api/sessions', json={"session_name": "SheetRollPayloadConsistency", "host_peer_id": "dm"})
+    session_id = created.json()['session_id']
+    host_token = created.json()['host_peer_token']
+    host_command = {"actor_peer_id": "dm", "actor_token": host_token}
+
+    imported = client.post(
+        f"/api/sessions/{session_id}/characters/import",
+        json={
+            "import_format": "json_schema",
+            "payload": '{"name":"Hero","character_class":"Fighter","level":3,"hit_points":20,"items":[]}',
+            "token_id": "hero",
+            "command": host_command,
+        },
+    )
+    assert imported.status_code == 200
+
+    rolled = client.post(
+        f"/api/sessions/{session_id}/sheet-actions/roll",
+        json={
+            "actor_id": "hero",
+            "action_type": "ability",
+            "action_key": "str",
+            "advantage_mode": "advantage",
+            "visibility_mode": "public",
+            "command": {"actor_peer_id": "dm", "actor_token": host_token, "expected_revision": 1},
+        },
+    )
+    assert rolled.status_code == 200
+    immediate = rolled.json()
+    assert isinstance(immediate.get("formula"), str)
+    assert isinstance(immediate.get("total"), int)
+    assert isinstance(immediate.get("dice"), list)
+    assert isinstance(immediate.get("modifier"), int)
+
+    replay = client.get(
+        f"/api/sessions/{session_id}/events/replay",
+        params={"after_revision": 0, "actor_peer_id": "dm", "actor_token": host_token},
+    )
+    assert replay.status_code == 200
+    event = next(event for event in replay.json()['events'] if event.get('event_type') == 'sheet_action_rolled')
+    payload = event["payload"]
+    assert payload.get("formula") == immediate.get("formula")
+    assert payload.get("total") == immediate.get("total")
+    assert payload.get("dice") == immediate.get("dice")
+    assert payload.get("modifier") == immediate.get("modifier")
+
+
+def test_token_light_endpoint_returns_400_for_invalid_radius_relationship() -> None:
+    client = TestClient(app)
+    created = client.post('/api/sessions', json={"session_name": "TokenLightValidation", "host_peer_id": "dm"})
+    session_id = created.json()['session_id']
+
+    moved = client.post(f"/api/sessions/{session_id}/move-token", json={"token_id": "hero", "x": 1, "y": 1})
+    assert moved.status_code == 200
+
+    invalid = client.post(
+        f"/api/sessions/{session_id}/token-light",
+        json={"token_id": "hero", "bright_radius": 8, "dim_radius": 3, "color": "#ffffff", "enabled": True, "command": {"expected_revision": 1}},
+    )
+    assert invalid.status_code == 400
+
+
+def test_scene_lighting_endpoint_returns_400_for_invalid_preset() -> None:
+    client = TestClient(app)
+    created = client.post('/api/sessions', json={"session_name": "SceneLightValidation", "host_peer_id": "dm"})
+    session_id = created.json()['session_id']
+
+    invalid = client.post(
+        f"/api/sessions/{session_id}/scene-lighting",
+        json={"preset": "gloom", "command": {"expected_revision": 0}},
+    )
+    assert invalid.status_code == 400

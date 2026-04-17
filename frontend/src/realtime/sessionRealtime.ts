@@ -1,10 +1,11 @@
 import { getEventReplayWithContext, getState, listCharacters, type ReadContext } from "../lib/apiClient";
 import { getDesktopConfigSync } from "../lib/desktopBridge";
-import type { CharacterSheet, Snapshot } from "../types";
+import type { CharacterSheet, SessionEvent, Snapshot } from "../types";
 
 type RealtimeHandlers = {
   onSnapshot: (snapshot: Snapshot) => void;
   onCharacters: (characters: CharacterSheet[]) => void;
+  onEvent?: (event: SessionEvent) => void;
   onStatus?: (status: string) => void;
 };
 
@@ -110,6 +111,7 @@ export function connectSessionEvents(
     ws.onmessage = async (message) => {
       if (isClosed || connectionNonce !== activeConnectionNonce) return;
       const event = JSON.parse(message.data) as { revision?: number; event_type?: string; payload?: Record<string, unknown> };
+      handlers.onEvent?.(event as SessionEvent);
       lastAppliedRevision = Math.max(lastAppliedRevision, getCurrentRevision());
 
       if (!redactionNoticeShown && event.payload && Object.keys(event.payload).length === 0 && typeof event.event_type === "string") {

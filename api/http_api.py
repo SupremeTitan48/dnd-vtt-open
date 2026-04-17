@@ -15,6 +15,7 @@ from api.schemas import (
     ActorStateRequest,
     BackupRequest,
     CharacterImportRequest,
+    ChatMessageRequest,
     CommandContextRequest,
     EncounterTemplateRequest,
     FogRequest,
@@ -32,9 +33,12 @@ from api.schemas import (
     RelayTicketRequest,
     RecomputeVisibilityRequest,
     TokenVisionRequest,
+    TokenLightRequest,
+    SceneLightingRequest,
     RevealCellRequest,
     ShareRequest,
     SessionCreateRequest,
+    SheetActionRollRequest,
     JournalEntryRequest,
     JournalEntryUpdateRequest,
     HandoutRequest,
@@ -49,6 +53,8 @@ from api.schemas import (
     RunMacroRequest,
     RestoreBackupRequest,
     RenderRollTemplateRequest,
+    InstallPackRequest,
+    ToggleModuleRequest,
     ExecutePluginHookRequest,
 )
 from app.commands.dispatcher import CommandDispatcher, InvalidCommandPayloadError, UnknownCommandError
@@ -321,12 +327,90 @@ async def update_actor_state(session_id: str, request: ActorStateRequest) -> dic
             'hit_points': request.hit_points,
             'add_item': request.add_item,
             'add_condition': request.add_condition,
+            'armor_class': request.armor_class,
+            'max_hit_points': request.max_hit_points,
+            'current_hit_points': request.current_hit_points,
+            'concentration': request.concentration,
+            'saves': request.saves,
+            'skills': request.skills,
+            'spell_slots': request.spell_slots,
+            'inventory_add': request.inventory_add,
+            'inventory_remove': request.inventory_remove,
         },
         request.command,
     )
     if not replay:
         await _publish_session_event(session_id, 'actor_updated', {'actor_id': request.actor_id}, revision=state.get('revision'))
     return {'session_id': session_id, 'state': state}
+
+
+@router.post('/sessions/{session_id}/sheet-actions/roll')
+async def roll_sheet_action(session_id: str, request: SheetActionRollRequest) -> dict:
+    replay = _is_idempotency_replay(session_id, request.command)
+    result = _dispatch_command(
+        session_id,
+        'roll_sheet_action',
+        {
+            'actor_id': request.actor_id,
+            'action_type': request.action_type,
+            'action_key': request.action_key,
+            'advantage_mode': request.advantage_mode,
+            'visibility_mode': request.visibility_mode,
+        },
+        request.command,
+    )
+    result = dict(result)
+    authoritative_payload = result.get('_authoritative_event_payload', {})
+    if not isinstance(authoritative_payload, dict) or not authoritative_payload:
+        authoritative_payload = {
+            'actor_id': request.actor_id,
+            'action_type': request.action_type,
+            'action_key': request.action_key,
+            'advantage_mode': request.advantage_mode,
+            'visibility_mode': request.visibility_mode,
+            'formula': result.get('formula'),
+            'total': result.get('total'),
+        }
+    if not replay:
+        await _publish_session_event(
+            session_id,
+            'sheet_action_rolled',
+            authoritative_payload,
+            revision=result.get('revision'),
+        )
+    result.pop('_authoritative_event_payload', None)
+    return result
+
+
+@router.post('/sessions/{session_id}/chat/messages')
+async def send_chat_message(session_id: str, request: ChatMessageRequest) -> dict:
+    replay = session_service.is_chat_idempotency_replay(session_id, _to_command_context(request.command))
+    result = _dispatch_command(
+        session_id,
+        'send_chat_message',
+        {
+            'content': request.content,
+            'kind': request.kind,
+            'visibility_mode': request.visibility_mode,
+            'whisper_targets': request.whisper_targets,
+        },
+        request.command,
+    )
+    if not replay:
+        await _publish_session_event(
+            session_id,
+            'chat_message',
+            {
+                'message_id': result.get('message_id'),
+                'sender_peer_id': result.get('sender_peer_id'),
+                'kind': result.get('kind'),
+                'content': result.get('content'),
+                'visibility_mode': result.get('visibility_mode'),
+                'whisper_targets': result.get('whisper_targets', []),
+            },
+            revision=result.get('revision'),
+        )
+    return result
 
 
 @router.post('/sessions/{session_id}/actor-ownership')
@@ -473,6 +557,66 @@ async def set_token_vision(session_id: str, request: TokenVisionRequest) -> dict
             session_id,
             'token_vision_updated',
             {'token_id': request.token_id, 'radius': request.radius},
+            revision=state.get('revision'),
+        )
+    return {'session_id': session_id, 'state': state}
+
+
+@router.post('/sessions/{session_id}/token-light')
+async def set_token_light(session_id: str, request: TokenLightRequest) -> dict:
+    replay = _is_idempotency_replay(session_id, request.command)
+    try:
+        state = _dispatch_command(
+            session_id,
+            'set_token_light',
+            {
+                'token_id': request.token_id,
+                'bright_radius': request.bright_radius,
+                'dim_radius': request.dim_radius,
+                'color': request.color,
+                'enabled': request.enabled,
+            },
+            request.command,
+        )
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not replay:
+        await _publish_session_event(
+            session_id,
+            'token_light_updated',
+            {
+                'token_id': request.token_id,
+                'bright_radius': request.bright_radius,
+                'dim_radius': request.dim_radius,
+                'color': request.color,
+                'enabled': request.enabled,
+            },
+            revision=state.get('revision'),
+        )
+    return {'session_id': session_id, 'state': state}
+
+
+@router.post('/sessions/{session_id}/scene-lighting')
+async def set_scene_lighting(session_id: str, request: SceneLightingRequest) -> dict:
+    replay = _is_idempotency_replay(session_id, request.command)
+    try:
+        state = _dispatch_command(
+            session_id,
+            'set_scene_lighting',
+            {'preset': request.preset},
+            request.command,
+        )
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not replay:
+        await _publish_session_event(
+            session_id,
+            'scene_lighting_updated',
+            {'preset': request.preset},
             revision=state.get('revision'),
         )
     return {'session_id': session_id, 'state': state}
@@ -944,6 +1088,104 @@ async def execute_plugin_hook(
             {'plugin_id': plugin_id, 'hook_name': hook_name},
             revision=result.get('revision'),
         )
+    return result
+
+
+@router.get('/sessions/{session_id}/modules')
+def list_modules(
+    session_id: str,
+    actor_peer_id: str | None = Query(default=None),
+    actor_token: str | None = Query(default=None),
+    actor_role: str | None = Query(default=None),
+) -> dict:
+    _require_read_identity(session_id, actor_peer_id, actor_token)
+    modules = session_service.list_modules(
+        session_id,
+        command=CommandContext(actor_peer_id=actor_peer_id, actor_role=actor_role),
+    )
+    if modules is None:
+        raise HTTPException(status_code=404, detail='Session not found')
+    return {'session_id': session_id, 'modules': modules}
+
+
+@router.post('/sessions/{session_id}/modules/install')
+def install_module_pack(session_id: str, request: InstallPackRequest) -> dict:
+    _require_command_identity(session_id, request.command)
+    assert request.command is not None and request.command.actor_peer_id is not None
+    _require_privileged_gm_read(
+        session_id,
+        actor_peer_id=request.command.actor_peer_id,
+        actor_token=request.command.actor_token,
+        actor_role=request.command.actor_role,
+        operation_name='module install',
+    )
+    try:
+        result = session_service.install_module_pack(
+            session_id,
+            manifest=request.manifest,
+            checksum_sha256=request.checksum_sha256,
+            signature_hmac_sha256=request.signature_hmac_sha256,
+            command=_to_command_context(request.command),
+        )
+    except SessionPermissionError as exc:
+        detail = str(exc)
+        lowered = detail.lower()
+        status_code = 400 if ('checksum' in lowered or 'signature' in lowered) else 403
+        raise HTTPException(status_code=status_code, detail=detail) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if result is None:
+        raise HTTPException(status_code=404, detail='Session not found')
+    return result
+
+
+@router.post('/sessions/{session_id}/modules/{module_id}/enable')
+def enable_module(session_id: str, module_id: str, request: ToggleModuleRequest) -> dict:
+    _require_command_identity(session_id, request.command)
+    assert request.command is not None and request.command.actor_peer_id is not None
+    _require_privileged_gm_read(
+        session_id,
+        actor_peer_id=request.command.actor_peer_id,
+        actor_token=request.command.actor_token,
+        actor_role=request.command.actor_role,
+        operation_name='module toggle',
+    )
+    try:
+        result = session_service.set_module_enabled(
+            session_id,
+            module_id=module_id,
+            enabled=True,
+            command=_to_command_context(request.command),
+        )
+    except SessionPermissionError as exc:
+        raise HTTPException(status_code=404 if 'not found' in str(exc).lower() else 403, detail=str(exc)) from exc
+    if result is None:
+        raise HTTPException(status_code=404, detail='Session not found')
+    return result
+
+
+@router.post('/sessions/{session_id}/modules/{module_id}/disable')
+def disable_module(session_id: str, module_id: str, request: ToggleModuleRequest) -> dict:
+    _require_command_identity(session_id, request.command)
+    assert request.command is not None and request.command.actor_peer_id is not None
+    _require_privileged_gm_read(
+        session_id,
+        actor_peer_id=request.command.actor_peer_id,
+        actor_token=request.command.actor_token,
+        actor_role=request.command.actor_role,
+        operation_name='module toggle',
+    )
+    try:
+        result = session_service.set_module_enabled(
+            session_id,
+            module_id=module_id,
+            enabled=False,
+            command=_to_command_context(request.command),
+        )
+    except SessionPermissionError as exc:
+        raise HTTPException(status_code=404 if 'not found' in str(exc).lower() else 403, detail=str(exc)) from exc
+    if result is None:
+        raise HTTPException(status_code=404, detail='Session not found')
     return result
 
 

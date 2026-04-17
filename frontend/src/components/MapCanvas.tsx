@@ -24,6 +24,9 @@ type Props = {
   canMoveTokens: boolean;
   canControlToken: (tokenId: string) => boolean;
   useVisibilityMask: boolean;
+  sceneLightingPreset: "day" | "dim" | "night";
+  tokenLights: Record<string, { bright_radius: number; dim_radius: number; color: string; enabled: boolean }>;
+  tokenVisionModes: Record<string, "normal" | "darkvision" | "truesight">;
   movementBudgetCells: number;
   rulerPreset: { start: { x: number; y: number }; end: { x: number; y: number }; nonce: number } | null;
   clearRulerSignal: number;
@@ -63,6 +66,9 @@ export function MapCanvas({
   canMoveTokens,
   canControlToken,
   useVisibilityMask,
+  sceneLightingPreset,
+  tokenLights,
+  tokenVisionModes,
   movementBudgetCells,
   rulerPreset,
   clearRulerSignal,
@@ -191,7 +197,18 @@ export function MapCanvas({
         {Object.entries(snapshot.map.terrain_tiles).map(([key, terrain]) => {
           const [x, y] = key.split(":").map(Number);
           if (!isCellVisible(x, y)) return null;
-          return <rect key={`terrain-${key}`} x={x * size} y={y * size} width={size} height={size} fill={TERRAIN_COLORS[terrain] ?? "var(--map-terrain-grass)"} opacity={0.85} />;
+          return (
+            <rect
+              data-testid={`terrain-${key}`}
+              key={`terrain-${key}`}
+              x={x * size}
+              y={y * size}
+              width={size}
+              height={size}
+              fill={TERRAIN_COLORS[terrain] ?? "var(--map-terrain-grass)"}
+              opacity={0.85}
+            />
+          );
         })}
 
         {Array.from({ length: snapshot.map.width + 1 }, (_, x) => (
@@ -200,17 +217,6 @@ export function MapCanvas({
         {Array.from({ length: snapshot.map.height + 1 }, (_, y) => (
           <line key={`hy-${y}`} x1={0} y1={y * size} x2={width} y2={y * size} stroke="var(--map-grid)" strokeWidth={1} />
         ))}
-
-        {snapshot.map.fog_enabled &&
-          Array.from({ length: snapshot.map.width }).flatMap((_, x) =>
-            Array.from({ length: snapshot.map.height }).map((_, y) => {
-              const cellKey = `${x}:${y}`;
-              const isRevealed = visibilityMask ? visibilityMask.has(cellKey) : revealed.has(cellKey);
-              return isRevealed ? null : (
-                <rect key={`fog-${x}-${y}`} x={x * size} y={y * size} width={size} height={size} fill="var(--map-fog)" />
-              );
-            }),
-          )}
 
         {Array.from(blocked).map((key) => {
           const [x, y] = key.split(":").map(Number);
@@ -237,6 +243,10 @@ export function MapCanvas({
         {Object.entries(snapshot.map.token_positions).map(([tokenId, [x, y]]) => {
           if (!isCellVisible(x, y)) return null;
           const selected = selectedTokens.includes(tokenId);
+          const tokenLight = tokenLights[tokenId];
+          const visionMode = tokenVisionModes[tokenId] ?? "normal";
+          const visionStroke =
+            visionMode === "truesight" ? "#d6a4ff" : visionMode === "darkvision" ? "#8ab4ff" : "var(--map-token-stroke)";
           return (
             <g
               key={tokenId}
@@ -255,7 +265,35 @@ export function MapCanvas({
               }}
               onDoubleClick={() => onTokenDoubleClick?.(tokenId)}
             >
+              {tokenLight?.enabled && tokenLight.dim_radius > 0 && (
+                <circle
+                  cx={x * size + size / 2}
+                  cy={y * size + size / 2}
+                  r={Math.max(size / 2, tokenLight.dim_radius * size)}
+                  fill={tokenLight.color}
+                  opacity={0.12}
+                />
+              )}
+              {tokenLight?.enabled && tokenLight.bright_radius > 0 && (
+                <circle
+                  cx={x * size + size / 2}
+                  cy={y * size + size / 2}
+                  r={Math.max(size / 2, tokenLight.bright_radius * size)}
+                  fill={tokenLight.color}
+                  opacity={0.2}
+                />
+              )}
               <circle cx={x * size + size / 2} cy={y * size + size / 2} r={selected ? 10 : 9} fill={selected ? "var(--map-token-selected)" : "var(--map-token-default)"} stroke="var(--map-token-stroke)" strokeWidth={2} />
+              <circle
+                cx={x * size + size / 2}
+                cy={y * size + size / 2}
+                r={selected ? 12 : 11}
+                fill="transparent"
+                stroke={visionStroke}
+                strokeDasharray={visionMode === "normal" ? undefined : "3 2"}
+                strokeOpacity={0.8}
+                strokeWidth={1}
+              />
               <text x={x * size + size / 2} y={y * size + size / 2 + 4} textAnchor="middle" fill="var(--map-token-stroke)" fontWeight={700} fontSize={12}>
                 {tokenId.slice(0, 1).toUpperCase()}
               </text>
@@ -277,6 +315,17 @@ export function MapCanvas({
           );
         })}
 
+        <rect
+          data-testid="scene-lighting-overlay"
+          x={0}
+          y={0}
+          width={width}
+          height={height}
+          fill="black"
+          opacity={sceneLightingPreset === "night" ? 0.35 : sceneLightingPreset === "dim" ? 0.2 : 0.06}
+          pointerEvents="none"
+        />
+
         {dragGhost && activeTool === "move" && (
           <circle cx={dragGhost.x * size + size / 2} cy={dragGhost.y * size + size / 2} r={11} fill="var(--map-ruler-ghost)" stroke="var(--map-ruler-ghost-stroke)" strokeDasharray="4 3" />
         )}
@@ -296,6 +345,17 @@ export function MapCanvas({
             <circle cx={rulerEnd.x * size + size / 2} cy={rulerEnd.y * size + size / 2} r={4} fill="var(--map-ruler)" />
           </g>
         )}
+
+        {snapshot.map.fog_enabled &&
+          Array.from({ length: snapshot.map.width }).flatMap((_, x) =>
+            Array.from({ length: snapshot.map.height }).map((_, y) => {
+              const cellKey = `${x}:${y}`;
+              const isRevealed = visibilityMask ? visibilityMask.has(cellKey) : revealed.has(cellKey);
+              return isRevealed ? null : (
+                <rect key={`fog-${x}-${y}`} x={x * size} y={y * size} width={size} height={size} fill="var(--map-fog)" />
+              );
+            }),
+          )}
       </svg>
       <div style={{ marginTop: 8, fontSize: 12, color: "var(--map-annotation)" }}>
         Active tool: {activeTool}. Shift/Cmd-click multi-select tokens. Right-click token for quick actions.

@@ -50,6 +50,27 @@ def test_map_layer_operations_roundtrip() -> None:
     assert restored.map_state.asset_stamps[(3, 3)] == "tree"
 
 
+def test_lighting_and_vision_roundtrip_defaults_and_updates() -> None:
+    engine = GameStateEngine(map_state=MapState(width=8, height=8))
+    engine.move_token("hero", 1, 1)
+    engine.set_scene_lighting("night")
+    engine.set_token_light(
+        "hero",
+        bright_radius=3,
+        dim_radius=6,
+        color="#ffaa66",
+        enabled=True,
+    )
+    engine.set_token_vision_mode("hero", "darkvision")
+
+    restored = GameStateEngine.from_snapshot(engine.snapshot())
+    assert restored.map_state.scene_lighting_preset == "night"
+    assert restored.map_state.token_light_by_token["hero"]["bright_radius"] == 3
+    assert restored.map_state.token_light_by_token["hero"]["dim_radius"] == 6
+    assert restored.map_state.token_light_by_token["hero"]["color"] == "#ffaa66"
+    assert restored.map_state.token_light_by_token["hero"]["enabled"] is True
+    assert restored.map_state.vision_mode_by_token["hero"] == "darkvision"
+
 def test_visibility_respects_blockers() -> None:
     engine = GameStateEngine(map_state=MapState(width=7, height=3))
     engine.move_token("hero", 1, 1)

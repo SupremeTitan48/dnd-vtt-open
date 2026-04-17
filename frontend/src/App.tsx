@@ -1,11 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ActorPanel } from "./components/ActorPanel";
 import { CharacterImportPanel } from "./components/CharacterImportPanel";
+import { CharacterSheetPanel } from "./components/CharacterSheetPanel";
+import { ChatPanel } from "./components/ChatPanel";
 import { CommandPalette, type CommandItem } from "./components/CommandPalette";
 import { DMToolsPanel } from "./components/DMToolsPanel";
 import { HandoutPanel } from "./components/HandoutPanel";
 import { InitiativePanel } from "./components/InitiativePanel";
 import { JournalPanel } from "./components/JournalPanel";
+import { ExtensionsManagerPanel } from "./components/ExtensionsManagerPanel";
 import { MapCanvas } from "./components/MapCanvas";
 import { MapToolsPanel, type FogMode, type MapTool } from "./components/MapToolsPanel";
 import { MacroPanel } from "./components/MacroPanel";
@@ -30,19 +33,24 @@ import {
   type CommandContext,
   createSession,
   createSessionInCampaign,
+  disableModule,
+  enableModule,
   executePluginHook,
+  getEventReplayWithContext,
   getSession,
   getEncounterTemplates,
   getSessionNotes,
   getState,
   getTutorial,
   importCharacter,
+  installModulePack,
   joinSession,
   listAssets,
   listCharacters,
   listHandouts,
   listJournalEntries,
   listMacros,
+  listModules,
   listPlugins,
   listRollTemplates,
   loadSession,
@@ -54,11 +62,15 @@ import {
   saveSession,
   registerPlugin,
   renderRollTemplate,
+  rollSheetAction,
+  sendChatMessage,
   runMacro,
   setFog,
   setInitiative,
   setSessionNotes,
   setTokenVisionRadius,
+  setTokenLight,
+  setSceneLighting,
   shareHandout,
   shareJournalEntry,
   stampAsset,
@@ -73,7 +85,8 @@ import { emitUxEvent } from "./lib/uxTelemetry";
 import { buildSessionIdHash, getRolePolicy, isActionAllowedForRole, type StatusKey } from "./lib/uxPolicy";
 import { addTokenToInitiative } from "./lib/combatUtils";
 import { getOnboardingSteps, getOnboardingStorageKey, isOnboardingStepComplete } from "./lib/onboardingModel";
-import type { AssetLibraryItem, CharacterSheet, EncounterTemplate, Handout, JournalEntry, Macro, Plugin, RollTemplate, Session, Snapshot, Tutorial } from "./types";
+import type { AssetLibraryItem, CharacterSheet, EncounterTemplate, Handout, JournalEntry, Macro, ModulePack, Plugin, RollTemplate, Session, Snapshot, Tutorial } from "./types";
+import type { ChatMessage, SessionEvent } from "./types";
 
 const EMPTY_STATE: Snapshot = {
   map: {
@@ -87,6 +100,9 @@ const EMPTY_STATE: Snapshot = {
     asset_stamps: {},
     visibility_cells_by_token: {},
     vision_radius_by_token: {},
+    vision_mode_by_token: {},
+    token_light_by_token: {},
+    scene_lighting_preset: "day",
   },
   combat: { initiative_order: [], turn_index: 0, round_number: 1 },
   actors: {},
@@ -107,6 +123,8 @@ export default function App() {
   const [macros, setMacros] = useState<Macro[]>([]);
   const [rollTemplates, setRollTemplates] = useState<RollTemplate[]>([]);
   const [plugins, setPlugins] = useState<Plugin[]>([]);
+  const [modules, setModules] = useState<ModulePack[]>([]);
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [selectedTokens, setSelectedTokens] = useState<string[]>(["hero"]);
   const [contextMenu, setContextMenu] = useState<ContextMenuState>(null);
   const [tokenHudAnchor, setTokenHudAnchor] = useState<{ tokenId: string; x: number; y: number } | null>(null);
@@ -122,6 +140,12 @@ export default function App() {
   const [assetId, setAssetId] = useState("tree");
   const [movementBudgetCells, setMovementBudgetCells] = useState(6);
   const [visionRadiusInput, setVisionRadiusInput] = useState(6);
+  const [selectedTokenLight, setSelectedTokenLight] = useState({
+    bright_radius: 0,
+    dim_radius: 0,
+    color: "#ffffff",
+    enabled: false,
+  });
   const [clearRulerSignal, setClearRulerSignal] = useState(0);
   const [fogMode, setFogMode] = useState<FogMode>("reveal");
   const [previewPlayerView, setPreviewPlayerView] = useState(false);
@@ -174,10 +198,11 @@ export default function App() {
       getEncounterTemplates(sessionId, context),
       listCharacters(sessionId, context),
     ]);
-    const [journalResp, handoutsResp, assetsResp] = await Promise.all([
+    const [journalResp, handoutsResp, assetsResp, modulesResp] = await Promise.all([
       listJournalEntries(sessionId, context),
       listHandouts(sessionId, context),
       listAssets(sessionId, context),
+      listModules(sessionId, context),
     ]);
     const role =
       (sessionResp.peer_roles && sessionResp.peer_roles[currentPeerId]) ||
@@ -191,10 +216,12 @@ export default function App() {
       setMacros(macrosResp.macros);
       setRollTemplates(rollTemplatesResp.roll_templates);
       setPlugins(pluginsResp.plugins);
+      setModules(modulesResp.modules);
     } else {
       setMacros([]);
       setRollTemplates([]);
       setPlugins([]);
+      setModules(modulesResp.modules);
     }
     setSession(sessionResp);
     setSnapshot(stateResp.state);
@@ -205,6 +232,12 @@ export default function App() {
     setJournalEntries(journalResp.journal_entries);
     setHandouts(handoutsResp.handouts);
     setAssetLibrary(assetsResp.assets);
+    const replay = await getEventReplayWithContext(sessionId, 0, context);
+    const initialMessages = replay.events
+      .filter((event) => event.event_type === "chat_message")
+      .map((event) => ({ ...(event.payload as ChatMessage), revision: event.revision }))
+      .filter((message) => typeof message.message_id === "string");
+    setChatMessages(initialMessages);
     setStatus(`Active session: ${sessionResp.session_name} as ${currentPeerId}`);
   }
 
@@ -299,6 +332,15 @@ export default function App() {
       {
         onSnapshot: setSnapshot,
         onCharacters: setCharacters,
+        onEvent: (event: SessionEvent) => {
+          if (event.event_type !== "chat_message") return;
+          const payload = event.payload as ChatMessage;
+          if (!payload || typeof payload.message_id !== "string") return;
+          setChatMessages((prev) => {
+            if (prev.some((m) => m.message_id === payload.message_id && m.revision === event.revision)) return prev;
+            return [...prev, { ...payload, revision: event.revision }];
+          });
+        },
         onStatus: setStatus,
       },
     );
@@ -538,6 +580,48 @@ export default function App() {
     return resp.rendered;
   }
 
+  async function handleRollSheetAction(payload: {
+    actor_id: string;
+    action_type: "ability" | "save" | "skill" | "attack" | "spell";
+    action_key: string;
+    advantage_mode: "normal" | "advantage" | "disadvantage";
+    visibility_mode: "public" | "private" | "gm_only";
+  }) {
+    if (!session || !canMutateWithPolicy) return;
+    const result = await rollSheetAction(session.session_id, payload, commandContext());
+    setStatus(`Rolled ${payload.action_type}:${payload.action_key} => ${result.total ?? "hidden"} (${result.formula ?? "redacted"})`);
+  }
+
+  async function handleSendChatMessage(payload: {
+    content: string;
+    kind: "ic" | "ooc" | "emote" | "system" | "whisper" | "roll";
+    visibility_mode: "public" | "private" | "gm_only";
+    whisper_targets: string[];
+  }) {
+    if (!session || !canMutateWithPolicy) return;
+    const sent = await sendChatMessage(session.session_id, payload, commandContext());
+    setChatMessages((prev) => {
+      if (prev.some((m) => m.message_id === sent.message_id && m.revision === sent.revision)) return prev;
+      return [...prev, sent];
+    });
+  }
+
+  async function handleUpdateSheetState(
+    actorId: string,
+    updates: {
+      concentration?: boolean;
+      spell_slots?: Record<string, { max: number; current: number }>;
+      inventory_add?: string;
+      inventory_remove?: string;
+    },
+  ) {
+    if (!session || !canMutateWithPolicy) return;
+    const response = await updateActor(session.session_id, actorId, undefined, undefined, undefined, commandContext(), updates);
+    setSnapshot(response.state);
+    const chars = await listCharacters(session.session_id, readContext());
+    setCharacters(chars.characters);
+  }
+
   async function handleRegisterPlugin(name: string, version: string, capabilities: string[]) {
     if (!session || !canUseGMTools) return;
     await registerPlugin(session.session_id, name, version, capabilities, commandContext());
@@ -550,6 +634,27 @@ export default function App() {
     const resp = await executePluginHook(session.session_id, pluginId, hookName, payload, commandContext());
     setStatus(`Plugin hook ${hookName} result: ${resp.status}`);
     return resp.status;
+  }
+
+  async function handleInstallModulePack(manifestJson: string) {
+    if (!session || !canUseGMTools) return;
+    await installModulePack(session.session_id, manifestJson, commandContext());
+    const modulesResp = await listModules(session.session_id, readContext());
+    setModules(modulesResp.modules);
+    await refreshSessionData(session.session_id);
+    setStatus("Module pack installed");
+  }
+
+  async function handleToggleModule(moduleId: string, enabled: boolean) {
+    if (!session || !canUseGMTools) return;
+    if (enabled) {
+      await enableModule(session.session_id, moduleId, commandContext());
+    } else {
+      await disableModule(session.session_id, moduleId, commandContext());
+    }
+    const modulesResp = await listModules(session.session_id, readContext());
+    setModules(modulesResp.modules);
+    setStatus(`Module ${enabled ? "enabled" : "disabled"}: ${moduleId}`);
   }
 
   async function handleToggleFog() {
@@ -608,6 +713,39 @@ export default function App() {
     } catch (err) {
       setStatus(`Set vision radius failed: ${(err as Error).message}`);
     }
+  }
+
+  useEffect(() => {
+    const tokenLight = snapshot.map.token_light_by_token?.[selectedLeadToken];
+    if (!tokenLight) {
+      setSelectedTokenLight({ bright_radius: 0, dim_radius: 0, color: "#ffffff", enabled: false });
+      return;
+    }
+    setSelectedTokenLight(tokenLight);
+  }, [selectedLeadToken, snapshot.map.token_light_by_token]);
+
+  async function handleSetSceneLightingPreset(preset: "day" | "dim" | "night") {
+    if (!session || !canUseGMTools) return;
+    const resp = await setSceneLighting(session.session_id, preset, commandContext());
+    setSnapshot(resp.state);
+    setStatus(`Scene lighting set to ${preset}`);
+  }
+
+  async function handleSetTokenLight(nextLight: { bright_radius: number; dim_radius: number; color: string; enabled: boolean }) {
+    if (!session || !canUseGMTools || !selectedLeadToken) return;
+    const resp = await setTokenLight(
+      session.session_id,
+      {
+        token_id: selectedLeadToken,
+        bright_radius: Math.max(0, Math.floor(nextLight.bright_radius)),
+        dim_radius: Math.max(0, Math.floor(nextLight.dim_radius)),
+        color: nextLight.color || "#ffffff",
+        enabled: Boolean(nextLight.enabled),
+      },
+      commandContext(),
+    );
+    setSnapshot(resp.state);
+    setSelectedTokenLight(nextLight);
   }
 
   async function handleReorderInitiative(nextOrder: string[]) {
@@ -789,6 +927,12 @@ export default function App() {
       content: (
         <>
           <ActorPanel snapshot={snapshot} />
+          <CharacterSheetPanel
+            characters={characters}
+            canRoll={canMutateWithPolicy}
+            onRoll={handleRollSheetAction}
+            onUpdateSheet={handleUpdateSheetState}
+          />
           <JournalPanel
             entries={journalEntries}
             peers={session?.peers ?? []}
@@ -829,6 +973,7 @@ export default function App() {
             onRegister={handleRegisterPlugin}
             onExecuteHook={handleExecutePluginHook}
           />
+          <ExtensionsManagerPanel modules={modules} canManage={canUseGMTools} onInstall={handleInstallModulePack} onToggle={handleToggleModule} />
           <div className="panel side-panel">
             <h3>Imported Characters</h3>
             <ul className="list">
@@ -854,10 +999,7 @@ export default function App() {
       id: "chat",
       title: "Chat and Notes",
       content: (
-        <div className="panel side-panel">
-          <p>Chat tray placeholder. Journal and handout collaboration currently live in the right drawer.</p>
-          <p>Latest status: {status}</p>
-        </div>
+        <ChatPanel messages={chatMessages} currentPeerId={currentPeerId} canPost={canMutateWithPolicy} onSend={handleSendChatMessage} />
       ),
     },
   ];
@@ -973,6 +1115,11 @@ export default function App() {
               onToggleFog={handleToggleFog}
               onHideAllFog={() => void handleHideAllFog()}
               onTogglePreviewPlayerView={() => setPreviewPlayerView((prev) => !prev)}
+              sceneLightingPreset={snapshot.map.scene_lighting_preset ?? "day"}
+              onSceneLightingPresetChange={(preset) => void handleSetSceneLightingPreset(preset)}
+              selectedTokenId={selectedLeadToken}
+              selectedTokenLight={selectedTokenLight}
+              onTokenLightChange={(nextLight) => void handleSetTokenLight(nextLight)}
             />
             </div>
             <div className="panel side-panel">
@@ -1026,6 +1173,9 @@ export default function App() {
               canMoveTokens={canMutateWithPolicy}
               canControlToken={canControlToken}
               useVisibilityMask={!canUseGMTools || previewPlayerView}
+              sceneLightingPreset={snapshot.map.scene_lighting_preset ?? "day"}
+              tokenLights={snapshot.map.token_light_by_token ?? {}}
+              tokenVisionModes={snapshot.map.vision_mode_by_token ?? {}}
               movementBudgetCells={movementBudgetCells}
               rulerPreset={rulerPreset}
               clearRulerSignal={clearRulerSignal}
