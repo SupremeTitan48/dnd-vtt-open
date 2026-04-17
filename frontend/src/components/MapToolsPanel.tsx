@@ -1,6 +1,7 @@
 import { useState } from "react";
 
 export type MapTool = "move" | "reveal" | "terrain" | "block" | "asset" | "ruler";
+export type FogMode = "reveal" | "rehide";
 
 type Props = {
   activeTool: MapTool;
@@ -15,6 +16,18 @@ type Props = {
   onClearRuler: () => void;
   onAddAssetOption: (assetId: string, name: string, uri: string) => Promise<void>;
   canEditMap: boolean;
+  fogEnabled: boolean;
+  fogMode: FogMode;
+  previewPlayerView: boolean;
+  onFogModeChange: (mode: FogMode) => void;
+  onToggleFog: () => void;
+  onHideAllFog: () => void;
+  onTogglePreviewPlayerView: () => void;
+  sceneLightingPreset: "day" | "dim" | "night";
+  onSceneLightingPresetChange: (preset: "day" | "dim" | "night") => void;
+  selectedTokenId: string;
+  selectedTokenLight: { bright_radius: number; dim_radius: number; color: string; enabled: boolean };
+  onTokenLightChange: (light: { bright_radius: number; dim_radius: number; color: string; enabled: boolean }) => void;
 };
 
 export function MapToolsPanel({
@@ -30,6 +43,18 @@ export function MapToolsPanel({
   onClearRuler,
   onAddAssetOption,
   canEditMap,
+  fogEnabled,
+  fogMode,
+  previewPlayerView,
+  onFogModeChange,
+  onToggleFog,
+  onHideAllFog,
+  onTogglePreviewPlayerView,
+  sceneLightingPreset,
+  onSceneLightingPresetChange,
+  selectedTokenId,
+  selectedTokenLight,
+  onTokenLightChange,
 }: Props) {
   const [newAssetId, setNewAssetId] = useState("");
   const [newAssetName, setNewAssetName] = useState("");
@@ -73,6 +98,89 @@ export function MapToolsPanel({
           <option value="clear">Clear</option>
         </select>
       )}
+
+      <div className="divider" />
+      <h3>Fog Workflow</h3>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
+        <button onClick={onToggleFog} disabled={!canEditMap}>{fogEnabled ? "Disable Fog" : "Enable Fog"}</button>
+        <button onClick={onHideAllFog} disabled={!canEditMap}>Hide All</button>
+        <button className={fogMode === "reveal" ? "active-tool" : ""} onClick={() => onFogModeChange("reveal")} disabled={!canEditMap}>
+          Reveal Area
+        </button>
+        <button className={fogMode === "rehide" ? "active-tool" : ""} onClick={() => onFogModeChange("rehide")} disabled={!canEditMap}>
+          Re-hide Area
+        </button>
+      </div>
+      <button style={{ marginTop: 6, width: "100%" }} onClick={onTogglePreviewPlayerView} disabled={!canEditMap}>
+        {previewPlayerView ? "Exit Player Preview" : "Preview Player View"}
+      </button>
+
+      <div className="divider" />
+      <h3>Lighting</h3>
+      <label style={{ fontSize: 12, color: "#aab3dd", display: "block" }}>
+        Scene Lighting
+        <select
+          aria-label="Scene Lighting"
+          value={sceneLightingPreset}
+          onChange={(e) => onSceneLightingPresetChange(e.target.value as "day" | "dim" | "night")}
+          style={{ marginTop: 4, width: "100%" }}
+          disabled={!canEditMap}
+        >
+          <option value="day">Day</option>
+          <option value="dim">Dim</option>
+          <option value="night">Night</option>
+        </select>
+      </label>
+      <p style={{ marginTop: 8, marginBottom: 6, fontSize: 12, color: "#aab3dd" }}>Selected token: {selectedTokenId}</p>
+      <label style={{ fontSize: 12, color: "#aab3dd", display: "flex", gap: 6, alignItems: "center" }}>
+        <input
+          aria-label="Token Light Enabled"
+          type="checkbox"
+          checked={selectedTokenLight.enabled}
+          disabled={!canEditMap}
+          onChange={(e) => onTokenLightChange({ ...selectedTokenLight, enabled: e.target.checked })}
+        />
+        Token Light Enabled
+      </label>
+      <label style={{ fontSize: 12, color: "#aab3dd", display: "block", marginTop: 6 }}>
+        Light Color
+        <input
+          aria-label="Light Color"
+          type="color"
+          value={selectedTokenLight.color}
+          disabled={!canEditMap}
+          onChange={(e) => onTokenLightChange({ ...selectedTokenLight, color: e.target.value })}
+          style={{ marginTop: 4, width: "100%" }}
+        />
+      </label>
+      <label style={{ fontSize: 12, color: "#aab3dd", display: "block", marginTop: 6 }}>
+        Bright Radius
+        <input
+          aria-label="Bright Radius"
+          type="number"
+          min={0}
+          value={selectedTokenLight.bright_radius}
+          disabled={!canEditMap}
+          onChange={(e) =>
+            onTokenLightChange({ ...selectedTokenLight, bright_radius: Math.max(0, Math.floor(Number(e.target.value) || 0)) })
+          }
+          style={{ marginTop: 4, width: "100%" }}
+        />
+      </label>
+      <label style={{ fontSize: 12, color: "#aab3dd", display: "block", marginTop: 6 }}>
+        Dim Radius
+        <input
+          aria-label="Dim Radius"
+          type="number"
+          min={0}
+          value={selectedTokenLight.dim_radius}
+          disabled={!canEditMap}
+          onChange={(e) =>
+            onTokenLightChange({ ...selectedTokenLight, dim_radius: Math.max(0, Math.floor(Number(e.target.value) || 0)) })
+          }
+          style={{ marginTop: 4, width: "100%" }}
+        />
+      </label>
 
       {activeTool === "asset" && (
         <>

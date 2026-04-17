@@ -4,9 +4,10 @@ type Props = {
   snapshot: Snapshot;
   onReorder: (nextOrder: string[]) => Promise<void>;
   canEdit: boolean;
+  onFocusCombatant?: (tokenId: string) => void;
 };
 
-export function InitiativePanel({ snapshot, onReorder, canEdit }: Props) {
+export function InitiativePanel({ snapshot, onReorder, canEdit, onFocusCombatant }: Props) {
   const { initiative_order, turn_index, round_number } = snapshot.combat;
   const active = initiative_order[turn_index];
 
@@ -20,6 +21,7 @@ export function InitiativePanel({ snapshot, onReorder, canEdit }: Props) {
           <li
             key={actor}
             draggable={canEdit}
+            onClick={() => onFocusCombatant?.(actor)}
             onDragStart={(e) => e.dataTransfer.setData("text/plain", actor)}
             onDragOver={(e) => e.preventDefault()}
             onDrop={async (e) => {

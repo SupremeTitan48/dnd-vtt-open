@@ -37,6 +37,15 @@ bash scripts/run_modern_ui.sh
 - API docs: `http://127.0.0.1:8000/docs`
 - Frontend UI: `http://127.0.0.1:5173`
 
+## Run (Electron desktop app)
+```bash
+bash scripts/run_desktop.sh
+```
+
+- Launches Electron desktop shell.
+- Automatically starts bundled local backend (`uvicorn`) and frontend dev renderer.
+- Desktop runtime uses loopback API/WS targets without manual browser setup.
+
 ## Legacy fallback (Tkinter)
 ```bash
 bash scripts/run_legacy_tk.sh
@@ -47,11 +56,14 @@ bash scripts/run_legacy_tk.sh
 .venv/bin/python -m ruff check .
 .venv/bin/pytest
 npm --prefix frontend run build
+npm --prefix desktop-electron run dist
 ```
 
 ## Architecture
 See `docs/architecture.md` and `docs/roadmap.md`.
 For operations workflows, see `docs/operations.md`.
+For upgrade/rollback procedures, see `docs/migration-playbook.md`.
+For release history, see `CHANGELOG.md`.
 
 ## Phase 4 status (roadmap alignment)
 - **Status:** complete (foundation + closeout hardening). Details: `docs/roadmap.md`.
@@ -76,18 +88,21 @@ For operations workflows, see `docs/operations.md`.
 - [x] Verification loop: backend tests, frontend tests, lint, and frontend build are green.
 
 ## Phase 5 status (production readiness)
-- Initial slice in place:
+- **Status:** complete for roadmap production-readiness scope.
+- Delivered:
   - Added `/health/ready` readiness endpoint for basic operational checks.
   - Added `/health/ops` operational endpoint for backup audit/rate-limit metrics.
+  - Added `/metrics` endpoint for Prometheus-style operational export.
   - Readiness checks currently verify writable session store and event log directories.
   - Added backup/restore APIs for session snapshots and metadata recovery.
-  - Added backup retention APIs for listing/pruning stored backups.
+  - Added backup retention APIs for listing/pruning stored backups (count-based and age-based).
   - Added portable backup export/import APIs with checksum validation.
   - Added GM/AssistantGM permission gates for all backup management operations.
   - Added backup operation audit records and configurable backup API rate limiting (`DND_VTT_BACKUP_RATE_LIMIT_*` env vars; see `docs/operations.md`).
-  - Added migration compatibility reporting in readiness responses.
-- Next Phase 5 priorities:
-  - Observability: structured logging and metrics beyond `/health/*`.
-  - Durable/shared rate-limit and audit storage for multi-process deployments.
-  - Explicit migration runner and schema upgrade paths (beyond readiness reporting).
-  - Optional: object storage or off-host backup sync; container/reverse-proxy deployment templates.
+  - Added backup import payload size guardrail (oversized imports rejected).
+  - Added optional HMAC-signed backup export/import authenticity validation (`DND_VTT_BACKUP_SIGNING_SECRET`).
+  - Added migration compatibility reporting in readiness responses (current schema version now includes v3 metadata normalization).
+  - Added a privileged session migration runner endpoint (`POST /api/sessions/{session_id}/migrate`) with dry-run and apply modes.
+  - Added structured JSON ops logging for backup and migration actions (`dnd_vtt.ops` logger).
+  - Added disaster-recovery drill script for backup/restore roundtrip validation (`scripts/run_disaster_recovery_drill.py`).
+  - Added configurable durable session store backend (`json`/`sqlite`) and production deployment templates (`deploy/`).

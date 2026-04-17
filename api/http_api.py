@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import json
+import logging
 import secrets
-from collections import deque
 from asyncio import gather
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -15,6 +15,7 @@ from api.schemas import (
     ActorStateRequest,
     BackupRequest,
     CharacterImportRequest,
+    ChatMessageRequest,
     CommandContextRequest,
     EncounterTemplateRequest,
     FogRequest,
@@ -23,20 +24,26 @@ from api.schemas import (
     MoveTokenRequest,
     NextTurnRequest,
     PaintTerrainRequest,
+    PruneBackupsByAgeRequest,
     PruneBackupsRequest,
     PluginRequest,
     MacroRequest,
+    MigrateSessionRequest,
     RollTemplateRequest,
     RelayTicketRequest,
     RecomputeVisibilityRequest,
     TokenVisionRequest,
+    TokenLightRequest,
+    SceneLightingRequest,
     RevealCellRequest,
     ShareRequest,
     SessionCreateRequest,
+    SheetActionRollRequest,
     JournalEntryRequest,
     JournalEntryUpdateRequest,
     HandoutRequest,
     HandoutUpdateRequest,
+    HideCellRequest,
     ImportBackupRequest,
     SessionRoleRequest,
     SessionNotesRequest,
@@ -46,12 +53,16 @@ from api.schemas import (
     RunMacroRequest,
     RestoreBackupRequest,
     RenderRollTemplateRequest,
+    InstallPackRequest,
+    ToggleModuleRequest,
     ExecutePluginHookRequest,
 )
 from app.commands.dispatcher import CommandDispatcher, InvalidCommandPayloadError, UnknownCommandError
 from app.events.file_event_log import JsonlEventLogSink
 from app.events.publisher import SessionEvent, SessionEventPublisher
 from app.backup_rate_limit_config import get_backup_rate_limit_config
+from app.observability import emit_ops_log
+from app.ops_state_store import create_ops_state_store
 from app.policies.access_control import can_view_gm_secrets, resolve_actor_role
 from app.services.session_service import CommandContext, SessionConflictError, SessionPermissionError, SessionService
 
@@ -62,7 +73,8 @@ _message_bus: dict[str, list[SignalMessage]] = {}
 _ws_connections: dict[str, list[tuple[WebSocket, CommandContext]]] = {}
 _event_log_sink = JsonlEventLogSink()
 _event_publisher = SessionEventPublisher(sinks=[_event_log_sink])
-_backup_rate_limit: dict[tuple[str, str], deque[datetime]] = {}
+_ops_state_store = create_ops_state_store()
+_ops_logger = logging.getLogger('dnd_vtt.ops')
 
 
 def _to_command_context(command: CommandContextRequest | None) -> CommandContext:
@@ -144,12 +156,13 @@ def _require_command_identity(session_id: str, command: CommandContextRequest | 
         raise HTTPException(status_code=403, detail='invalid actor token')
 
 
-def _require_backup_admin(
+def _require_privileged_gm_read(
     session_id: str,
     *,
     actor_peer_id: str,
     actor_token: str | None,
     actor_role: str | None = None,
+    operation_name: str = 'operation',
 ) -> None:
     if not session_service.validate_peer_token(session_id, actor_peer_id, actor_token):
         raise HTTPException(status_code=403, detail='invalid actor token')
@@ -158,26 +171,31 @@ def _require_backup_admin(
         raise HTTPException(status_code=404, detail='Session not found')
     resolved_role = resolve_actor_role(session, actor_peer_id=actor_peer_id, actor_role=actor_role)
     if not can_view_gm_secrets(resolved_role):
-        raise HTTPException(status_code=403, detail='backup operations require GM or AssistantGM role')
+        raise HTTPException(status_code=403, detail=f'{operation_name} requires GM or AssistantGM role')
 
 
 def _check_backup_rate_limit(session_id: str, actor_peer_id: str) -> None:
     limit, window_seconds = get_backup_rate_limit_config()
-    key = (session_id, actor_peer_id)
-    now = datetime.now(timezone.utc)
-    window_start = now - timedelta(seconds=window_seconds)
-    bucket = _backup_rate_limit.setdefault(key, deque())
-    while bucket and bucket[0] < window_start:
-        bucket.popleft()
-    if len(bucket) >= limit:
-        session_service.record_backup_audit(
+    if not _ops_state_store.try_acquire_rate_limit(
+        session_id,
+        actor_peer_id,
+        limit=limit,
+        window_seconds=window_seconds,
+    ):
+        _ops_state_store.record_backup_audit(
             session_id,
             actor_peer_id=actor_peer_id,
             action='backup_rate_limited',
             detail={'limit': limit, 'window_seconds': window_seconds},
         )
+        emit_ops_log(
+            _ops_logger,
+            event_type='backup_rate_limited',
+            session_id=session_id,
+            actor_peer_id=actor_peer_id,
+            detail={'limit': limit, 'window_seconds': window_seconds},
+        )
         raise HTTPException(status_code=429, detail='backup operation rate limit exceeded')
-    bucket.append(now)
 
 
 @router.post('/sessions')
@@ -309,12 +327,90 @@ async def update_actor_state(session_id: str, request: ActorStateRequest) -> dic
             'hit_points': request.hit_points,
             'add_item': request.add_item,
             'add_condition': request.add_condition,
+            'armor_class': request.armor_class,
+            'max_hit_points': request.max_hit_points,
+            'current_hit_points': request.current_hit_points,
+            'concentration': request.concentration,
+            'saves': request.saves,
+            'skills': request.skills,
+            'spell_slots': request.spell_slots,
+            'inventory_add': request.inventory_add,
+            'inventory_remove': request.inventory_remove,
         },
         request.command,
     )
     if not replay:
         await _publish_session_event(session_id, 'actor_updated', {'actor_id': request.actor_id}, revision=state.get('revision'))
     return {'session_id': session_id, 'state': state}
+
+
+@router.post('/sessions/{session_id}/sheet-actions/roll')
+async def roll_sheet_action(session_id: str, request: SheetActionRollRequest) -> dict:
+    replay = _is_idempotency_replay(session_id, request.command)
+    result = _dispatch_command(
+        session_id,
+        'roll_sheet_action',
+        {
+            'actor_id': request.actor_id,
+            'action_type': request.action_type,
+            'action_key': request.action_key,
+            'advantage_mode': request.advantage_mode,
+            'visibility_mode': request.visibility_mode,
+        },
+        request.command,
+    )
+    result = dict(result)
+    authoritative_payload = result.get('_authoritative_event_payload', {})
+    if not isinstance(authoritative_payload, dict) or not authoritative_payload:
+        authoritative_payload = {
+            'actor_id': request.actor_id,
+            'action_type': request.action_type,
+            'action_key': request.action_key,
+            'advantage_mode': request.advantage_mode,
+            'visibility_mode': request.visibility_mode,
+            'formula': result.get('formula'),
+            'total': result.get('total'),
+        }
+    if not replay:
+        await _publish_session_event(
+            session_id,
+            'sheet_action_rolled',
+            authoritative_payload,
+            revision=result.get('revision'),
+        )
+    result.pop('_authoritative_event_payload', None)
+    return result
+
+
+@router.post('/sessions/{session_id}/chat/messages')
+async def send_chat_message(session_id: str, request: ChatMessageRequest) -> dict:
+    replay = session_service.is_chat_idempotency_replay(session_id, _to_command_context(request.command))
+    result = _dispatch_command(
+        session_id,
+        'send_chat_message',
+        {
+            'content': request.content,
+            'kind': request.kind,
+            'visibility_mode': request.visibility_mode,
+            'whisper_targets': request.whisper_targets,
+        },
+        request.command,
+    )
+    if not replay:
+        await _publish_session_event(
+            session_id,
+            'chat_message',
+            {
+                'message_id': result.get('message_id'),
+                'sender_peer_id': result.get('sender_peer_id'),
+                'kind': result.get('kind'),
+                'content': result.get('content'),
+                'visibility_mode': result.get('visibility_mode'),
+                'whisper_targets': result.get('whisper_targets', []),
+            },
+            revision=result.get('revision'),
+        )
+    return result
 
 
 @router.post('/sessions/{session_id}/actor-ownership')
@@ -370,6 +466,15 @@ async def reveal_cell(session_id: str, request: RevealCellRequest) -> dict:
     state = _dispatch_command(session_id, 'reveal_cell', {'x': request.x, 'y': request.y}, request.command)
     if not replay:
         await _publish_session_event(session_id, 'cell_revealed', {'x': request.x, 'y': request.y}, revision=state.get('revision'))
+    return {'session_id': session_id, 'state': state}
+
+
+@router.post('/sessions/{session_id}/hide-cell')
+async def hide_cell(session_id: str, request: HideCellRequest) -> dict:
+    replay = _is_idempotency_replay(session_id, request.command)
+    state = _dispatch_command(session_id, 'hide_cell', {'x': request.x, 'y': request.y}, request.command)
+    if not replay:
+        await _publish_session_event(session_id, 'cell_hidden', {'x': request.x, 'y': request.y}, revision=state.get('revision'))
     return {'session_id': session_id, 'state': state}
 
 
@@ -436,17 +541,82 @@ async def recompute_visibility(session_id: str, request: RecomputeVisibilityRequ
 @router.post('/sessions/{session_id}/token-vision')
 async def set_token_vision(session_id: str, request: TokenVisionRequest) -> dict:
     replay = _is_idempotency_replay(session_id, request.command)
-    state = _dispatch_command(
-        session_id,
-        'set_token_vision_radius',
-        {'token_id': request.token_id, 'radius': request.radius},
-        request.command,
-    )
+    try:
+        state = _dispatch_command(
+            session_id,
+            'set_token_vision_radius',
+            {'token_id': request.token_id, 'radius': request.radius},
+            request.command,
+        )
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not replay:
         await _publish_session_event(
             session_id,
             'token_vision_updated',
             {'token_id': request.token_id, 'radius': request.radius},
+            revision=state.get('revision'),
+        )
+    return {'session_id': session_id, 'state': state}
+
+
+@router.post('/sessions/{session_id}/token-light')
+async def set_token_light(session_id: str, request: TokenLightRequest) -> dict:
+    replay = _is_idempotency_replay(session_id, request.command)
+    try:
+        state = _dispatch_command(
+            session_id,
+            'set_token_light',
+            {
+                'token_id': request.token_id,
+                'bright_radius': request.bright_radius,
+                'dim_radius': request.dim_radius,
+                'color': request.color,
+                'enabled': request.enabled,
+            },
+            request.command,
+        )
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not replay:
+        await _publish_session_event(
+            session_id,
+            'token_light_updated',
+            {
+                'token_id': request.token_id,
+                'bright_radius': request.bright_radius,
+                'dim_radius': request.dim_radius,
+                'color': request.color,
+                'enabled': request.enabled,
+            },
+            revision=state.get('revision'),
+        )
+    return {'session_id': session_id, 'state': state}
+
+
+@router.post('/sessions/{session_id}/scene-lighting')
+async def set_scene_lighting(session_id: str, request: SceneLightingRequest) -> dict:
+    replay = _is_idempotency_replay(session_id, request.command)
+    try:
+        state = _dispatch_command(
+            session_id,
+            'set_scene_lighting',
+            {'preset': request.preset},
+            request.command,
+        )
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not replay:
+        await _publish_session_event(
+            session_id,
+            'scene_lighting_updated',
+            {'preset': request.preset},
             revision=state.get('revision'),
         )
     return {'session_id': session_id, 'state': state}
@@ -921,6 +1091,104 @@ async def execute_plugin_hook(
     return result
 
 
+@router.get('/sessions/{session_id}/modules')
+def list_modules(
+    session_id: str,
+    actor_peer_id: str | None = Query(default=None),
+    actor_token: str | None = Query(default=None),
+    actor_role: str | None = Query(default=None),
+) -> dict:
+    _require_read_identity(session_id, actor_peer_id, actor_token)
+    modules = session_service.list_modules(
+        session_id,
+        command=CommandContext(actor_peer_id=actor_peer_id, actor_role=actor_role),
+    )
+    if modules is None:
+        raise HTTPException(status_code=404, detail='Session not found')
+    return {'session_id': session_id, 'modules': modules}
+
+
+@router.post('/sessions/{session_id}/modules/install')
+def install_module_pack(session_id: str, request: InstallPackRequest) -> dict:
+    _require_command_identity(session_id, request.command)
+    assert request.command is not None and request.command.actor_peer_id is not None
+    _require_privileged_gm_read(
+        session_id,
+        actor_peer_id=request.command.actor_peer_id,
+        actor_token=request.command.actor_token,
+        actor_role=request.command.actor_role,
+        operation_name='module install',
+    )
+    try:
+        result = session_service.install_module_pack(
+            session_id,
+            manifest=request.manifest,
+            checksum_sha256=request.checksum_sha256,
+            signature_hmac_sha256=request.signature_hmac_sha256,
+            command=_to_command_context(request.command),
+        )
+    except SessionPermissionError as exc:
+        detail = str(exc)
+        lowered = detail.lower()
+        status_code = 400 if ('checksum' in lowered or 'signature' in lowered) else 403
+        raise HTTPException(status_code=status_code, detail=detail) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if result is None:
+        raise HTTPException(status_code=404, detail='Session not found')
+    return result
+
+
+@router.post('/sessions/{session_id}/modules/{module_id}/enable')
+def enable_module(session_id: str, module_id: str, request: ToggleModuleRequest) -> dict:
+    _require_command_identity(session_id, request.command)
+    assert request.command is not None and request.command.actor_peer_id is not None
+    _require_privileged_gm_read(
+        session_id,
+        actor_peer_id=request.command.actor_peer_id,
+        actor_token=request.command.actor_token,
+        actor_role=request.command.actor_role,
+        operation_name='module toggle',
+    )
+    try:
+        result = session_service.set_module_enabled(
+            session_id,
+            module_id=module_id,
+            enabled=True,
+            command=_to_command_context(request.command),
+        )
+    except SessionPermissionError as exc:
+        raise HTTPException(status_code=404 if 'not found' in str(exc).lower() else 403, detail=str(exc)) from exc
+    if result is None:
+        raise HTTPException(status_code=404, detail='Session not found')
+    return result
+
+
+@router.post('/sessions/{session_id}/modules/{module_id}/disable')
+def disable_module(session_id: str, module_id: str, request: ToggleModuleRequest) -> dict:
+    _require_command_identity(session_id, request.command)
+    assert request.command is not None and request.command.actor_peer_id is not None
+    _require_privileged_gm_read(
+        session_id,
+        actor_peer_id=request.command.actor_peer_id,
+        actor_token=request.command.actor_token,
+        actor_role=request.command.actor_role,
+        operation_name='module toggle',
+    )
+    try:
+        result = session_service.set_module_enabled(
+            session_id,
+            module_id=module_id,
+            enabled=False,
+            command=_to_command_context(request.command),
+        )
+    except SessionPermissionError as exc:
+        raise HTTPException(status_code=404 if 'not found' in str(exc).lower() else 403, detail=str(exc)) from exc
+    if result is None:
+        raise HTTPException(status_code=404, detail='Session not found')
+    return result
+
+
 @router.get('/sessions/{session_id}/encounter-templates')
 def get_templates(
     session_id: str,
@@ -954,24 +1222,72 @@ def load_session(session_id: str) -> dict:
     return {'session_id': session_id, 'state': state}
 
 
-@router.post('/sessions/{session_id}/backup')
-def backup_session(session_id: str, request: BackupRequest | None = None) -> dict:
-    _require_command_identity(session_id, request.command if request else None)
-    assert request is not None and request.command is not None and request.command.actor_peer_id is not None
-    _require_backup_admin(
+@router.post('/sessions/{session_id}/migrate')
+def migrate_session(session_id: str, request: MigrateSessionRequest) -> dict:
+    _require_command_identity(session_id, request.command)
+    assert request.command is not None and request.command.actor_peer_id is not None
+    _require_privileged_gm_read(
         session_id,
         actor_peer_id=request.command.actor_peer_id,
         actor_token=request.command.actor_token,
         actor_role=request.command.actor_role,
+        operation_name='migration operations',
+    )
+    result = session_service.migrate_session(session_id, dry_run=request.dry_run)
+    if result is None:
+        raise HTTPException(status_code=404, detail='Session not found')
+    _ops_state_store.record_backup_audit(
+        session_id,
+        actor_peer_id=request.command.actor_peer_id,
+        action='session_migrated' if result.get('migrated') else 'session_migration_checked',
+        detail={
+            'dry_run': request.dry_run,
+            'from_schema_version': result.get('from_schema_version'),
+            'to_schema_version': result.get('to_schema_version'),
+            'applied_migrations': result.get('applied_migrations', []),
+        },
+    )
+    emit_ops_log(
+        _ops_logger,
+        event_type='session_migrated' if result.get('migrated') else 'session_migration_checked',
+        session_id=session_id,
+        actor_peer_id=request.command.actor_peer_id,
+        detail={
+            'dry_run': request.dry_run,
+            'from_schema_version': result.get('from_schema_version'),
+            'to_schema_version': result.get('to_schema_version'),
+            'applied_migrations': result.get('applied_migrations', []),
+        },
+    )
+    return result
+
+
+@router.post('/sessions/{session_id}/backup')
+def backup_session(session_id: str, request: BackupRequest | None = None) -> dict:
+    _require_command_identity(session_id, request.command if request else None)
+    assert request is not None and request.command is not None and request.command.actor_peer_id is not None
+    _require_privileged_gm_read(
+        session_id,
+        actor_peer_id=request.command.actor_peer_id,
+        actor_token=request.command.actor_token,
+        actor_role=request.command.actor_role,
+        operation_name='backup operations',
     )
     _check_backup_rate_limit(session_id, request.command.actor_peer_id)
     backup = session_service.backup(session_id)
     if backup is None:
         raise HTTPException(status_code=404, detail='Session not found')
-    session_service.record_backup_audit(
+    _ops_state_store.record_backup_audit(
         session_id,
         actor_peer_id=request.command.actor_peer_id,
         action='backup_created',
+        detail={'backup_id': backup['backup_id']},
+    )
+    emit_ops_log(
+        _ops_logger,
+        event_type='backup_created',
+        session_id=session_id,
+        actor_peer_id=request.command.actor_peer_id,
         detail={'backup_id': backup['backup_id']},
     )
     return {'session_id': session_id, 'backup_id': backup['backup_id'], 'backup_path': str(backup['backup_path'])}
@@ -981,11 +1297,12 @@ def backup_session(session_id: str, request: BackupRequest | None = None) -> dic
 def restore_session_backup(session_id: str, request: RestoreBackupRequest) -> dict:
     _require_command_identity(session_id, request.command)
     assert request.command is not None and request.command.actor_peer_id is not None
-    _require_backup_admin(
+    _require_privileged_gm_read(
         session_id,
         actor_peer_id=request.command.actor_peer_id,
         actor_token=request.command.actor_token,
         actor_role=request.command.actor_role,
+        operation_name='backup operations',
     )
     _check_backup_rate_limit(session_id, request.command.actor_peer_id)
     try:
@@ -994,10 +1311,17 @@ def restore_session_backup(session_id: str, request: RestoreBackupRequest) -> di
         raise HTTPException(status_code=403, detail=str(exc)) from exc
     if state is None:
         raise HTTPException(status_code=404, detail='Backup not found')
-    session_service.record_backup_audit(
+    _ops_state_store.record_backup_audit(
         session_id,
         actor_peer_id=request.command.actor_peer_id,
         action='backup_restored',
+        detail={'backup_id': request.backup_id},
+    )
+    emit_ops_log(
+        _ops_logger,
+        event_type='backup_restored',
+        session_id=session_id,
+        actor_peer_id=request.command.actor_peer_id,
         detail={'backup_id': request.backup_id},
     )
     return {'session_id': session_id, 'state': state}
@@ -1012,7 +1336,13 @@ def list_session_backups(
 ) -> dict:
     _require_read_identity(session_id, actor_peer_id, actor_token)
     assert actor_peer_id is not None
-    _require_backup_admin(session_id, actor_peer_id=actor_peer_id, actor_token=actor_token, actor_role=actor_role)
+    _require_privileged_gm_read(
+        session_id,
+        actor_peer_id=actor_peer_id,
+        actor_token=actor_token,
+        actor_role=actor_role,
+        operation_name='backup operations',
+    )
     backups = session_service.list_backups(session_id)
     return {'session_id': session_id, 'backups': backups}
 
@@ -1021,19 +1351,56 @@ def list_session_backups(
 def prune_session_backups(session_id: str, request: PruneBackupsRequest) -> dict:
     _require_command_identity(session_id, request.command)
     assert request.command is not None and request.command.actor_peer_id is not None
-    _require_backup_admin(
+    _require_privileged_gm_read(
         session_id,
         actor_peer_id=request.command.actor_peer_id,
         actor_token=request.command.actor_token,
         actor_role=request.command.actor_role,
+        operation_name='backup operations',
     )
     _check_backup_rate_limit(session_id, request.command.actor_peer_id)
     result = session_service.prune_backups(session_id, request.keep_latest)
-    session_service.record_backup_audit(
+    _ops_state_store.record_backup_audit(
         session_id,
         actor_peer_id=request.command.actor_peer_id,
         action='backups_pruned',
         detail={'keep_latest': request.keep_latest, **result},
+    )
+    emit_ops_log(
+        _ops_logger,
+        event_type='backups_pruned',
+        session_id=session_id,
+        actor_peer_id=request.command.actor_peer_id,
+        detail={'keep_latest': request.keep_latest, **result},
+    )
+    return {'session_id': session_id, **result}
+
+
+@router.post('/sessions/{session_id}/backups/prune-by-age')
+def prune_session_backups_by_age(session_id: str, request: PruneBackupsByAgeRequest) -> dict:
+    _require_command_identity(session_id, request.command)
+    assert request.command is not None and request.command.actor_peer_id is not None
+    _require_privileged_gm_read(
+        session_id,
+        actor_peer_id=request.command.actor_peer_id,
+        actor_token=request.command.actor_token,
+        actor_role=request.command.actor_role,
+        operation_name='backup operations',
+    )
+    _check_backup_rate_limit(session_id, request.command.actor_peer_id)
+    result = session_service.prune_backups_by_age(session_id, request.max_age_days)
+    _ops_state_store.record_backup_audit(
+        session_id,
+        actor_peer_id=request.command.actor_peer_id,
+        action='backups_pruned_by_age',
+        detail={'max_age_days': request.max_age_days, **result},
+    )
+    emit_ops_log(
+        _ops_logger,
+        event_type='backups_pruned_by_age',
+        session_id=session_id,
+        actor_peer_id=request.command.actor_peer_id,
+        detail={'max_age_days': request.max_age_days, **result},
     )
     return {'session_id': session_id, **result}
 
@@ -1048,7 +1415,13 @@ def export_session_backup(
 ) -> dict:
     _require_read_identity(session_id, actor_peer_id, actor_token)
     assert actor_peer_id is not None
-    _require_backup_admin(session_id, actor_peer_id=actor_peer_id, actor_token=actor_token, actor_role=actor_role)
+    _require_privileged_gm_read(
+        session_id,
+        actor_peer_id=actor_peer_id,
+        actor_token=actor_token,
+        actor_role=actor_role,
+        operation_name='backup operations',
+    )
     _check_backup_rate_limit(session_id, actor_peer_id)
     try:
         exported = session_service.export_backup(session_id, backup_id)
@@ -1056,10 +1429,17 @@ def export_session_backup(
         raise HTTPException(status_code=403, detail=str(exc)) from exc
     if exported is None:
         raise HTTPException(status_code=404, detail='Backup not found')
-    session_service.record_backup_audit(
+    _ops_state_store.record_backup_audit(
         session_id,
         actor_peer_id=actor_peer_id,
         action='backup_exported',
+        detail={'backup_id': backup_id},
+    )
+    emit_ops_log(
+        _ops_logger,
+        event_type='backup_exported',
+        session_id=session_id,
+        actor_peer_id=actor_peer_id,
         detail={'backup_id': backup_id},
     )
     return {'session_id': session_id, **exported}
@@ -1069,23 +1449,37 @@ def export_session_backup(
 def import_session_backup(session_id: str, request: ImportBackupRequest) -> dict:
     _require_command_identity(session_id, request.command)
     assert request.command is not None and request.command.actor_peer_id is not None
-    _require_backup_admin(
+    _require_privileged_gm_read(
         session_id,
         actor_peer_id=request.command.actor_peer_id,
         actor_token=request.command.actor_token,
         actor_role=request.command.actor_role,
+        operation_name='backup operations',
     )
     _check_backup_rate_limit(session_id, request.command.actor_peer_id)
     try:
-        imported = session_service.import_backup(session_id, request.backup, request.checksum_sha256)
+        imported = session_service.import_backup(
+            session_id,
+            request.backup,
+            request.checksum_sha256,
+            signature_hmac_sha256=request.signature_hmac_sha256,
+        )
     except SessionPermissionError as exc:
         detail = str(exc)
-        status_code = 400 if 'checksum' in detail.lower() else 403
+        lowered = detail.lower()
+        status_code = 400 if ('checksum' in lowered or 'too large' in lowered or 'signature' in lowered) else 403
         raise HTTPException(status_code=status_code, detail=detail) from exc
-    session_service.record_backup_audit(
+    _ops_state_store.record_backup_audit(
         session_id,
         actor_peer_id=request.command.actor_peer_id,
         action='backup_imported',
+        detail={'backup_id': imported['backup_id']},
+    )
+    emit_ops_log(
+        _ops_logger,
+        event_type='backup_imported',
+        session_id=session_id,
+        actor_peer_id=request.command.actor_peer_id,
         detail={'backup_id': imported['backup_id']},
     )
     return {'session_id': session_id, 'backup_id': imported['backup_id'], 'backup_path': str(imported['backup_path'])}
@@ -1100,10 +1494,14 @@ def list_backup_audit(
 ) -> dict:
     _require_read_identity(session_id, actor_peer_id, actor_token)
     assert actor_peer_id is not None
-    _require_backup_admin(session_id, actor_peer_id=actor_peer_id, actor_token=actor_token, actor_role=actor_role)
-    audit = session_service.get_backup_audit(session_id)
-    if audit is None:
-        raise HTTPException(status_code=404, detail='Session not found')
+    _require_privileged_gm_read(
+        session_id,
+        actor_peer_id=actor_peer_id,
+        actor_token=actor_token,
+        actor_role=actor_role,
+        operation_name='backup operations',
+    )
+    audit = _ops_state_store.get_backup_audit(session_id)
     return {'session_id': session_id, 'audit': audit}
 
 

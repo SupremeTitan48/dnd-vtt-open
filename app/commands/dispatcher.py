@@ -8,6 +8,8 @@ from api_contracts.commands import (
     AddAssetLibraryItemCommand,
     CreateMacroCommand,
     ExecutePluginHookCommand,
+    SendChatMessageCommand,
+    HideCellCommand,
     CreateRollTemplateCommand,
     AssignActorOwnerCommand,
     AssignSessionRoleCommand,
@@ -20,6 +22,8 @@ from api_contracts.commands import (
     PaintTerrainCommand,
     RevealCellCommand,
     RecomputeVisibilityCommand,
+    SetSceneLightingCommand,
+    SetTokenLightCommand,
     SetTokenVisionRadiusCommand,
     ShareHandoutCommand,
     ShareJournalEntryCommand,
@@ -31,6 +35,7 @@ from api_contracts.commands import (
     RunMacroCommand,
     RenderRollTemplateCommand,
     RegisterPluginCommand,
+    SheetActionRollCommand,
     UpdateHandoutCommand,
     UpdateJournalEntryCommand,
     UpdateActorCommand,
@@ -56,11 +61,14 @@ class CommandDispatcher:
             'update_actor': self._handle_update_actor,
             'set_fog': self._handle_set_fog,
             'reveal_cell': self._handle_reveal_cell,
+            'hide_cell': self._handle_hide_cell,
             'paint_terrain': self._handle_paint_terrain,
             'toggle_blocked': self._handle_toggle_blocked,
             'stamp_asset': self._handle_stamp_asset,
             'recompute_visibility': self._handle_recompute_visibility,
             'set_token_vision_radius': self._handle_set_token_vision_radius,
+            'set_token_light': self._handle_set_token_light,
+            'set_scene_lighting': self._handle_set_scene_lighting,
             'import_character': self._handle_import_character,
             'set_notes': self._handle_set_notes,
             'add_encounter_template': self._handle_add_encounter_template,
@@ -79,6 +87,8 @@ class CommandDispatcher:
             'render_roll_template': self._handle_render_roll_template,
             'register_plugin': self._handle_register_plugin,
             'execute_plugin_hook': self._handle_execute_plugin_hook,
+            'roll_sheet_action': self._handle_roll_sheet_action,
+            'send_chat_message': self._handle_send_chat_message,
         }
         self._contracts: dict[str, type[BaseModel]] = {
             'move_token': MoveTokenCommand,
@@ -87,11 +97,14 @@ class CommandDispatcher:
             'update_actor': UpdateActorCommand,
             'set_fog': SetFogCommand,
             'reveal_cell': RevealCellCommand,
+            'hide_cell': HideCellCommand,
             'paint_terrain': PaintTerrainCommand,
             'toggle_blocked': ToggleBlockedCommand,
             'stamp_asset': StampAssetCommand,
             'recompute_visibility': RecomputeVisibilityCommand,
             'set_token_vision_radius': SetTokenVisionRadiusCommand,
+            'set_token_light': SetTokenLightCommand,
+            'set_scene_lighting': SetSceneLightingCommand,
             'import_character': ImportCharacterCommand,
             'set_notes': SetNotesCommand,
             'add_encounter_template': AddEncounterTemplateCommand,
@@ -110,6 +123,8 @@ class CommandDispatcher:
             'render_roll_template': RenderRollTemplateCommand,
             'register_plugin': RegisterPluginCommand,
             'execute_plugin_hook': ExecutePluginHookCommand,
+            'roll_sheet_action': SheetActionRollCommand,
+            'send_chat_message': SendChatMessageCommand,
         }
 
     def dispatch(self, session_id: str, action: str, payload: dict[str, Any], command: CommandContext) -> dict[str, Any] | None:
@@ -151,6 +166,15 @@ class CommandDispatcher:
             hit_points=payload.get('hit_points'),
             add_item=payload.get('add_item'),
             add_condition=payload.get('add_condition'),
+            armor_class=payload.get('armor_class'),
+            max_hit_points=payload.get('max_hit_points'),
+            current_hit_points=payload.get('current_hit_points'),
+            concentration=payload.get('concentration'),
+            saves=payload.get('saves'),
+            skills=payload.get('skills'),
+            spell_slots=payload.get('spell_slots'),
+            inventory_add=payload.get('inventory_add'),
+            inventory_remove=payload.get('inventory_remove'),
             command=command,
         )
 
@@ -159,6 +183,9 @@ class CommandDispatcher:
 
     def _handle_reveal_cell(self, session_id: str, payload: dict[str, Any], command: CommandContext) -> dict[str, Any] | None:
         return self._session_service.reveal_cell(session_id, payload['x'], payload['y'], command=command)
+
+    def _handle_hide_cell(self, session_id: str, payload: dict[str, Any], command: CommandContext) -> dict[str, Any] | None:
+        return self._session_service.hide_cell(session_id, payload['x'], payload['y'], command=command)
 
     def _handle_paint_terrain(self, session_id: str, payload: dict[str, Any], command: CommandContext) -> dict[str, Any] | None:
         return self._session_service.paint_terrain(session_id, payload['x'], payload['y'], payload['terrain_type'], command=command)
@@ -186,6 +213,28 @@ class CommandDispatcher:
             session_id,
             payload['token_id'],
             payload['radius'],
+            command=command,
+        )
+
+    def _handle_set_token_light(
+        self, session_id: str, payload: dict[str, Any], command: CommandContext
+    ) -> dict[str, Any] | None:
+        return self._session_service.set_token_light(
+            session_id,
+            payload['token_id'],
+            bright_radius=payload['bright_radius'],
+            dim_radius=payload['dim_radius'],
+            color=payload['color'],
+            enabled=payload['enabled'],
+            command=command,
+        )
+
+    def _handle_set_scene_lighting(
+        self, session_id: str, payload: dict[str, Any], command: CommandContext
+    ) -> dict[str, Any] | None:
+        return self._session_service.set_scene_lighting(
+            session_id,
+            payload['preset'],
             command=command,
         )
 
@@ -357,5 +406,30 @@ class CommandDispatcher:
             payload['plugin_id'],
             payload['hook_name'],
             payload.get('payload', {}),
+            command=command,
+        )
+
+    def _handle_roll_sheet_action(
+        self, session_id: str, payload: dict[str, Any], command: CommandContext
+    ) -> dict[str, Any] | None:
+        return self._session_service.roll_sheet_action(
+            session_id=session_id,
+            actor_id=payload['actor_id'],
+            action_type=payload['action_type'],
+            action_key=payload['action_key'],
+            advantage_mode=payload.get('advantage_mode', 'normal'),
+            visibility_mode=payload.get('visibility_mode', 'public'),
+            command=command,
+        )
+
+    def _handle_send_chat_message(
+        self, session_id: str, payload: dict[str, Any], command: CommandContext
+    ) -> dict[str, Any] | None:
+        return self._session_service.send_chat_message(
+            session_id=session_id,
+            content=payload['content'],
+            kind=payload.get('kind', 'ic'),
+            visibility_mode=payload.get('visibility_mode', 'public'),
+            whisper_targets=payload.get('whisper_targets', []),
             command=command,
         )

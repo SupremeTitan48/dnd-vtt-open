@@ -2,13 +2,21 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import hmac
 import json
+import random
 import secrets
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from app.backup_import_config import get_backup_import_max_bytes
+from app.backup_signature_config import compute_backup_signature, get_backup_signing_secret
+from api_contracts.packs import InstallablePackManifest
+from app.migrations.runner import run_session_migrations
+from app.migrations.status import CURRENT_SCHEMA_VERSION, MIN_SUPPORTED_SCHEMA_VERSION
+from app.session_store_config import create_session_store
 from app.policies.access_control import PermissionDeniedError, can_access_resource, can_view_gm_secrets, resolve_actor_role
 from content.character_import import import_character_by_format
 from content.tutorial_loader import load_tutorial
@@ -38,12 +46,60 @@ class CommandContext:
 
 @dataclass
 class SessionService:
-    store: SessionStore = field(default_factory=lambda: SessionStore(Path('.sessions')))
+    store: SessionStore = field(default_factory=create_session_store)
     sessions: dict[str, dict[str, Any]] = field(default_factory=dict)
     engines: dict[str, GameStateEngine] = field(default_factory=dict)
     campaigns: dict[str, dict[str, Any]] = field(default_factory=dict)
     plugin_hook_executor: Callable[[dict[str, Any], str, dict[str, Any]], dict[str, Any]] | None = None
     allowed_roles: set[str] = field(default_factory=lambda: {'GM', 'AssistantGM', 'Player', 'Observer'})
+
+    @staticmethod
+    def _sheet_default_fields() -> dict[str, Any]:
+        return {
+            'actor_id': '',
+            'abilities': {},
+            'saves': {},
+            'skills': {},
+            'attacks': {},
+            'spells': {},
+            'armor_class': 10,
+            'max_hit_points': 1,
+            'current_hit_points': 1,
+            'concentration': False,
+            'spell_slots': {},
+            'inventory': [],
+            'proficiency_bonus': 2,
+        }
+
+    @staticmethod
+    def _scene_light_bonus(preset: str) -> int:
+        # Preserve legacy visibility behavior at "day" while allowing scene presets
+        # to reduce vision radius in darker conditions unless token lights compensate.
+        return {"night": -4, "dim": -2, "day": 0}.get(str(preset), 0)
+
+    @staticmethod
+    def _vision_mode_bonus(mode: str) -> int:
+        return {"normal": 0, "darkvision": 6, "truesight": 12}.get(str(mode), 0)
+
+    def _effective_vision_radius(self, session_id: str, token_id: str) -> int:
+        engine = self.get_engine(session_id)
+        if not engine:
+            return 0
+        base = int(engine.map_state.vision_radius_by_token.get(token_id, 0))
+        mode = str(engine.map_state.vision_mode_by_token.get(token_id, "normal"))
+        scene_preset = str(engine.map_state.scene_lighting_preset or "day")
+        token_light = engine.map_state.token_light_by_token.get(token_id, {})
+        light_enabled = bool(token_light.get("enabled", False)) if isinstance(token_light, dict) else False
+        light_dim = int(token_light.get("dim_radius", 0)) if isinstance(token_light, dict) else 0
+        return max(base + self._vision_mode_bonus(mode) + self._scene_light_bonus(scene_preset), light_dim if light_enabled else 0)
+
+    def _recompute_all_token_visibility(self, session_id: str) -> None:
+        engine = self.get_engine(session_id)
+        if not engine:
+            return
+        for token_id in list(engine.map_state.token_positions.keys()):
+            radius = self._effective_vision_radius(session_id, token_id)
+            engine.compute_visible_cells(token_id, radius)
 
     def _ensure_metadata(self, session_id: str) -> None:
         session = self.sessions.get(session_id)
@@ -55,8 +111,11 @@ class SessionService:
             session.setdefault('revision', 0)
             session.setdefault('peer_roles', {session.get('host_peer_id', 'host'): 'GM'})
             session.setdefault('idempotency_results', {})
+            session.setdefault('chat_idempotency_results', {})
             session.setdefault('actor_owners', {})
             session.setdefault('peer_tokens', {session.get('host_peer_id', 'host'): secrets.token_urlsafe(24)})
+            session.setdefault('enabled_modules', [])
+            session.setdefault('idempotency_payload_hashes', {})
             self._ensure_campaign(session['campaign_id'])
 
     def _default_encounter_templates(self) -> list[dict[str, str]]:
@@ -80,7 +139,22 @@ class SessionService:
                 'plugins': [],
                 'plugin_hook_executions': [],
                 'backup_audit': [],
+                'modules': [],
             }
+
+    @staticmethod
+    def _upsert_by_key(items: list[dict[str, Any]], key: str, payload: dict[str, Any]) -> None:
+        identifier = payload.get(key)
+        if not isinstance(identifier, str) or not identifier:
+            return
+        existing = next((item for item in items if item.get(key) == identifier), None)
+        if existing is not None:
+            existing.update(payload)
+            return
+        items.append(payload)
+
+    def _canonical_json_bytes(self, payload: dict[str, Any]) -> bytes:
+        return json.dumps(payload, sort_keys=True, separators=(',', ':')).encode('utf-8')
 
     def _campaign_for_session(self, session_id: str) -> dict[str, Any]:
         session = self.sessions.get(session_id)
@@ -125,7 +199,7 @@ class SessionService:
             raise ValueError('Session engine not found')
         snapshot = engine.snapshot()
         snapshot['revision'] = self._current_revision(session_id)
-        snapshot['schema_version'] = 1
+        snapshot['schema_version'] = int(self.sessions.get(session_id, {}).get('schema_version', MIN_SUPPORTED_SCHEMA_VERSION))
         return snapshot
 
     def _prepare_mutation(
@@ -161,6 +235,17 @@ class SessionService:
         self._ensure_metadata(session_id)
         self.sessions[session_id]['idempotency_results'][normalized.idempotency_key] = result
 
+    def _register_idempotency_payload_hash(self, session_id: str, command: CommandContext | None, payload_hash: str) -> None:
+        normalized = self._normalize_command(command)
+        if not normalized.idempotency_key:
+            return
+        self._ensure_metadata(session_id)
+        payload_hashes = self.sessions[session_id].setdefault('idempotency_payload_hashes', {})
+        existing = payload_hashes.get(normalized.idempotency_key)
+        if existing is not None and existing != payload_hash:
+            raise SessionPermissionError('Idempotency key reuse with different payload is not allowed')
+        payload_hashes[normalized.idempotency_key] = payload_hash
+
     def is_idempotency_replay(self, session_id: str, command: CommandContext | None) -> bool:
         session = self.sessions.get(session_id)
         if not session:
@@ -171,10 +256,54 @@ class SessionService:
         self._ensure_metadata(session_id)
         return normalized.idempotency_key in session['idempotency_results']
 
+    def _chat_idempotency_cache_key(self, command: CommandContext | None) -> tuple[str, str]:
+        normalized = self._normalize_command(command)
+        if not normalized.idempotency_key:
+            return ("", "")
+        return (normalized.idempotency_key, normalized.actor_peer_id or "")
+
+    def is_chat_idempotency_replay(self, session_id: str, command: CommandContext | None) -> bool:
+        session = self.sessions.get(session_id)
+        if not session:
+            return False
+        key = self._chat_idempotency_cache_key(command)
+        if not key[0]:
+            return False
+        self._ensure_metadata(session_id)
+        return key in session['chat_idempotency_results']
+
     def _can_view_gm_secrets(self, session: dict[str, Any], command: CommandContext | None) -> bool:
         normalized = self._normalize_command(command)
         role = self._resolve_role(session, normalized)
         return can_view_gm_secrets(role)
+
+    def _has_roll_gm_visibility(self, session: dict[str, Any], command: CommandContext | None) -> bool:
+        normalized = self._normalize_command(command)
+        role = self._resolve_role(session, normalized)
+        return role in {'GM', 'AssistantGM'}
+
+    def _can_view_chat_payload(self, session: dict[str, Any], payload: dict[str, Any], command: CommandContext | None) -> bool:
+        normalized = self._normalize_command(command)
+        actor_peer_id = normalized.actor_peer_id
+        if self._has_roll_gm_visibility(session, command):
+            return True
+        visibility_mode = str(payload.get('visibility_mode', 'public'))
+        sender_peer_id = payload.get('sender_peer_id')
+        whisper_targets = payload.get('whisper_targets', [])
+        target_set = {target for target in whisper_targets if isinstance(target, str)}
+        if isinstance(sender_peer_id, str) and actor_peer_id == sender_peer_id:
+            return True
+        if actor_peer_id and actor_peer_id in target_set:
+            return True
+        if str(payload.get('kind', 'ic')) == 'whisper':
+            return False
+        if visibility_mode == 'public':
+            return True
+        if visibility_mode == 'gm_only':
+            return False
+        if visibility_mode == 'private':
+            return False
+        return str(payload.get('kind', 'ic')) != 'whisper'
 
     def _is_actor_owner(self, session: dict[str, Any], actor_id: str, command: CommandContext | None) -> bool:
         normalized = self._normalize_command(command)
@@ -232,7 +361,7 @@ class SessionService:
         if not isinstance(payload, dict):
             return None
         event_type = event.get('event_type')
-        if event_type == 'actor_updated':
+        if event_type in {'actor_updated', 'sheet_action_rolled'}:
             actor_id = payload.get('actor_id')
             return actor_id if isinstance(actor_id, str) else None
         if event_type in {'token_moved', 'character_imported', 'actor_owner_assigned'}:
@@ -269,9 +398,28 @@ class SessionService:
             if isinstance(token_id, str) and token_id not in self._owned_actor_ids_for_command(session, command):
                 filtered['payload'] = {}
                 return filtered
+        if event_type in {'token_light_updated', 'token_vision_mode_updated'}:
+            token_id = payload.get('token_id')
+            if isinstance(token_id, str) and token_id not in self._owned_actor_ids_for_command(session, command):
+                filtered['payload'] = {}
+                return filtered
 
         if event_type in {'session_role_assigned', 'actor_owner_assigned', 'journal_entry_shared', 'handout_shared'}:
             filtered['payload'] = {}
+        if event_type == 'sheet_action_rolled':
+            visibility_mode = str(payload.get('visibility_mode', 'public'))
+            actor_id = payload.get('actor_id')
+            if visibility_mode == 'gm_only' and not self._has_roll_gm_visibility(session, command):
+                filtered['payload'] = {'actor_id': actor_id, 'visibility_mode': visibility_mode}
+            if visibility_mode == 'private' and isinstance(actor_id, str):
+                if not self._has_roll_gm_visibility(session, command) and not self._is_actor_owner(session, actor_id, command):
+                    filtered['payload'] = {'actor_id': actor_id, 'visibility_mode': visibility_mode}
+        if event_type == 'chat_message':
+            if not self._can_view_chat_payload(session, payload, command):
+                filtered['payload'] = {
+                    'kind': payload.get('kind', 'ic'),
+                    'visibility_mode': payload.get('visibility_mode', 'public'),
+                }
         if event_type in {'macro_created', 'macro_ran'} and not self._can_view_gm_secrets(session, command):
             filtered['payload'] = {}
         if event_type in {'roll_template_created', 'roll_template_rendered'} and not self._can_view_gm_secrets(session, command):
@@ -296,7 +444,14 @@ class SessionService:
         return filtered
 
     def _filter_session_for_view(self, session: dict[str, Any], command: CommandContext | None) -> dict[str, Any]:
-        filtered = {k: v for k, v in session.items() if k != 'idempotency_results'}
+        filtered = {
+            k: v
+            for k, v in session.items()
+            if k not in {'idempotency_results', 'chat_idempotency_results', 'idempotency_payload_hashes'}
+        }
+        normalized = self._normalize_command(command)
+        if normalized.actor_peer_id != session.get('host_peer_id'):
+            filtered.pop('peer_tokens', None)
         if self._can_view_gm_secrets(session, command):
             return filtered
         filtered = filtered.copy()
@@ -335,6 +490,20 @@ class SessionService:
                 for token_id, radius in radius_by_token.items()
                 if token_id in owned_actors
             }
+        mode_by_token = filtered_map.get('vision_mode_by_token')
+        if isinstance(mode_by_token, dict):
+            filtered_map['vision_mode_by_token'] = {
+                token_id: mode
+                for token_id, mode in mode_by_token.items()
+                if token_id in owned_actors
+            }
+        light_by_token = filtered_map.get('token_light_by_token')
+        if isinstance(light_by_token, dict):
+            filtered_map['token_light_by_token'] = {
+                token_id: light
+                for token_id, light in light_by_token.items()
+                if token_id in owned_actors
+            }
         return filtered
 
     def create_session(
@@ -363,6 +532,8 @@ class SessionService:
             'idempotency_results': {},
             'actor_owners': {},
             'peer_tokens': {host_peer_id: secrets.token_urlsafe(24)},
+            'schema_version': CURRENT_SCHEMA_VERSION,
+            'migration_history': [],
         }
         self.engines[session_id] = GameStateEngine(map_state=MapState(width=map_width, height=map_height))
         created = self.sessions[session_id].copy()
@@ -415,6 +586,7 @@ class SessionService:
         if cached is not None:
             return cached
         engine.move_token(token_id, x, y)
+        self._recompute_all_token_visibility(session_id)
         self._increment_revision(session_id)
         result = self._state_with_revision(session_id)
         self._cache_result(session_id, command, result)
@@ -454,6 +626,15 @@ class SessionService:
         hit_points: int | None,
         add_item: str | None,
         add_condition: str | None,
+        armor_class: int | None = None,
+        max_hit_points: int | None = None,
+        current_hit_points: int | None = None,
+        concentration: bool | None = None,
+        saves: dict[str, int] | None = None,
+        skills: dict[str, dict[str, int | str]] | None = None,
+        spell_slots: dict[str, dict[str, int]] | None = None,
+        inventory_add: str | None = None,
+        inventory_remove: str | None = None,
         command: CommandContext | None = None,
     ) -> dict[str, Any] | None:
         engine = self.get_engine(session_id)
@@ -476,6 +657,39 @@ class SessionService:
             engine.add_item(actor_id, add_item)
         if add_condition:
             engine.add_condition(actor_id, add_condition)
+        self._ensure_metadata(session_id)
+        for character in session.get('characters', []):
+            if character.get('_token_id') != actor_id:
+                continue
+            for key, value in self._sheet_default_fields().items():
+                character.setdefault(key, value)
+            if armor_class is not None:
+                character['armor_class'] = armor_class
+            if max_hit_points is not None:
+                character['max_hit_points'] = max_hit_points
+            if current_hit_points is not None:
+                character['current_hit_points'] = current_hit_points
+                character['hit_points'] = current_hit_points
+                engine.set_hit_points(actor_id, current_hit_points)
+            elif hit_points is not None:
+                character['current_hit_points'] = hit_points
+                character['hit_points'] = hit_points
+            if concentration is not None:
+                character['concentration'] = concentration
+            if saves is not None:
+                character['saves'] = saves
+            if skills is not None:
+                character['skills'] = skills
+            if spell_slots is not None:
+                character['spell_slots'] = spell_slots
+            if inventory_add:
+                character.setdefault('inventory', [])
+                if inventory_add not in character['inventory']:
+                    character['inventory'].append(inventory_add)
+            if inventory_remove:
+                character.setdefault('inventory', [])
+                character['inventory'] = [item for item in character['inventory'] if item != inventory_remove]
+            break
         self._increment_revision(session_id)
         result = self._state_with_revision(session_id)
         self._cache_result(session_id, command, result)
@@ -502,6 +716,19 @@ class SessionService:
         if cached is not None:
             return cached
         engine.reveal_cell(x, y)
+        self._increment_revision(session_id)
+        result = self._state_with_revision(session_id)
+        self._cache_result(session_id, command, result)
+        return result
+
+    def hide_cell(self, session_id: str, x: int, y: int, command: CommandContext | None = None) -> dict[str, Any] | None:
+        engine = self.get_engine(session_id)
+        if not engine:
+            return None
+        cached = self._prepare_mutation(session_id, command, resource='map')
+        if cached is not None:
+            return cached
+        engine.hide_cell(x, y)
         self._increment_revision(session_id)
         result = self._state_with_revision(session_id)
         self._cache_result(session_id, command, result)
@@ -571,10 +798,147 @@ class SessionService:
         if cached is not None:
             return cached
         engine.set_token_vision_radius(token_id, radius)
+        self._recompute_all_token_visibility(session_id)
         self._increment_revision(session_id)
         result = self._state_with_revision(session_id)
         self._cache_result(session_id, command, result)
         return result
+
+    def set_token_light(
+        self,
+        session_id: str,
+        token_id: str,
+        *,
+        bright_radius: int,
+        dim_radius: int,
+        color: str,
+        enabled: bool,
+        command: CommandContext | None = None,
+    ) -> dict[str, Any] | None:
+        engine = self.get_engine(session_id)
+        if not engine:
+            return None
+        session = self.sessions.get(session_id)
+        if session is None:
+            return None
+        cached = self._prepare_mutation(
+            session_id,
+            command,
+            resource='map',
+            is_owner=self._is_actor_owner(session, token_id, command),
+        )
+        if cached is not None:
+            return cached
+        engine.set_token_light(
+            token_id,
+            bright_radius=bright_radius,
+            dim_radius=dim_radius,
+            color=color,
+            enabled=enabled,
+        )
+        self._recompute_all_token_visibility(session_id)
+        self._increment_revision(session_id)
+        result = self._state_with_revision(session_id)
+        self._cache_result(session_id, command, result)
+        return result
+
+    def set_scene_lighting(self, session_id: str, preset: str, command: CommandContext | None = None) -> dict[str, Any] | None:
+        engine = self.get_engine(session_id)
+        if not engine:
+            return None
+        cached = self._prepare_mutation(session_id, command, resource='map')
+        if cached is not None:
+            return cached
+        engine.set_scene_lighting(preset)
+        self._recompute_all_token_visibility(session_id)
+        self._increment_revision(session_id)
+        result = self._state_with_revision(session_id)
+        self._cache_result(session_id, command, result)
+        return result
+
+    def roll_sheet_action(
+        self,
+        session_id: str,
+        actor_id: str,
+        action_type: str,
+        action_key: str,
+        advantage_mode: str,
+        visibility_mode: str,
+        command: CommandContext | None = None,
+    ) -> dict[str, Any] | None:
+        session = self.sessions.get(session_id)
+        if not session:
+            return None
+        cached = self._prepare_mutation(
+            session_id,
+            command,
+            resource='actor',
+            is_owner=self._is_actor_owner(session, actor_id, command),
+        )
+        if cached is not None:
+            return self._roll_response_for_command(session, cached, command)
+        character = next((item for item in session.get('characters', []) if item.get('_token_id') == actor_id), None)
+        if character is None:
+            raise SessionPermissionError('Character not found')
+
+        modifier = 0
+        if action_type == 'ability':
+            modifier = int(character.get('abilities', {}).get(action_key, 0))
+        elif action_type == 'save':
+            modifier = int(character.get('saves', {}).get(action_key, 0))
+        elif action_type == 'skill':
+            skill_data = character.get('skills', {}).get(action_key, {})
+            base = int(skill_data.get('modifier', 0)) if isinstance(skill_data, dict) else 0
+            tier = skill_data.get('proficiency', 'none') if isinstance(skill_data, dict) else 'none'
+            proficiency_bonus = int(character.get('proficiency_bonus', 2))
+            multiplier = self._skill_proficiency_multiplier(tier)
+            modifier = base + int(proficiency_bonus * multiplier)
+        elif action_type in {'attack', 'spell'}:
+            source = character.get('attacks', {}) if action_type == 'attack' else character.get('spells', {})
+            modifier = int(source.get(action_key, {}).get('modifier', 0)) if isinstance(source, dict) else 0
+
+        d1 = random.randint(1, 20)
+        d2 = random.randint(1, 20)
+        selected = d1
+        if advantage_mode == 'advantage':
+            selected = max(d1, d2)
+        elif advantage_mode == 'disadvantage':
+            selected = min(d1, d2)
+        total = selected + modifier
+
+        formula = f'1d20{modifier:+d}'
+        if advantage_mode == 'advantage':
+            formula = f'2d20kh1{modifier:+d}'
+        elif advantage_mode == 'disadvantage':
+            formula = f'2d20kl1{modifier:+d}'
+
+        self._increment_revision(session_id)
+        result = {
+            'session_id': session_id,
+            'actor_id': actor_id,
+            'action_type': action_type,
+            'action_key': action_key,
+            'advantage_mode': advantage_mode,
+            'visibility_mode': visibility_mode,
+            'formula': formula,
+            'dice': [d1, d2] if advantage_mode in {'advantage', 'disadvantage'} else [d1],
+            'modifier': modifier,
+            'total': total,
+            'revision': self._current_revision(session_id),
+        }
+        result['_authoritative_event_payload'] = {
+            'actor_id': actor_id,
+            'action_type': action_type,
+            'action_key': action_key,
+            'advantage_mode': advantage_mode,
+            'visibility_mode': visibility_mode,
+            'formula': formula,
+            'total': total,
+            'dice': [d1, d2] if advantage_mode in {'advantage', 'disadvantage'} else [d1],
+            'modifier': modifier,
+        }
+        self._cache_result(session_id, command, result)
+        return self._roll_response_for_command(session, result, command)
 
     def import_character(
         self,
@@ -595,16 +959,22 @@ class SessionService:
 
         character = import_character_by_format(import_format, payload).model_dump()
         resolved_token = token_id or character['name'].lower().replace(' ', '-')
-        session['characters'].append({**character, '_token_id': resolved_token})
+        full_character = {**self._sheet_default_fields(), **character}
+        full_character['actor_id'] = resolved_token
+        full_character['inventory'] = list(full_character.get('items', []))
+        full_character['max_hit_points'] = int(full_character.get('max_hit_points') or full_character.get('hit_points') or 1)
+        full_character['current_hit_points'] = int(full_character.get('current_hit_points') or full_character.get('hit_points') or 1)
+        full_character['hit_points'] = full_character['current_hit_points']
+        session['characters'].append({**full_character, '_token_id': resolved_token})
         if resolved_token not in engine.map_state.token_positions:
             engine.move_token(resolved_token, 0, 0)
-        engine.set_hit_points(resolved_token, character['hit_points'])
-        for item in character.get('items', []):
+        engine.set_hit_points(resolved_token, full_character['current_hit_points'])
+        for item in full_character.get('inventory', []):
             engine.add_item(resolved_token, item)
 
         self._increment_revision(session_id)
         result = {
-            'character': character,
+            'character': full_character,
             'token_id': resolved_token,
             'state': self._state_with_revision(session_id),
         }
@@ -622,6 +992,9 @@ class SessionService:
         self._ensure_metadata(session_id)
         if not self._is_known_peer(session, command):
             return None
+        for character in session['characters']:
+            if not character.get('actor_id') and isinstance(character.get('_token_id'), str):
+                character['actor_id'] = character['_token_id']
         characters = session['characters']
         if self._can_view_gm_secrets(session, command):
             return [{k: v for k, v in character.items() if not k.startswith('_')} for character in characters]
@@ -631,6 +1004,67 @@ class SessionService:
             if isinstance(actor_id, str) and self._can_view_actor(session, actor_id, command):
                 visible.append({k: v for k, v in character.items() if not k.startswith('_')})
         return visible
+
+    def _filter_roll_result_for_view(
+        self,
+        session: dict[str, Any],
+        result: dict[str, Any],
+        command: CommandContext | None,
+    ) -> dict[str, Any]:
+        visibility_mode = str(result.get('visibility_mode', 'public'))
+        actor_id = result.get('actor_id')
+        if visibility_mode == 'public':
+            return result
+        is_gm = self._has_roll_gm_visibility(session, command)
+        is_owner = isinstance(actor_id, str) and self._is_actor_owner(session, actor_id, command)
+        if visibility_mode == 'gm_only' and not is_gm:
+            return {
+                'session_id': result.get('session_id'),
+                'actor_id': actor_id,
+                'action_type': result.get('action_type'),
+                'action_key': result.get('action_key'),
+                'advantage_mode': result.get('advantage_mode'),
+                'visibility_mode': visibility_mode,
+                'revision': result.get('revision'),
+            }
+        if visibility_mode == 'private' and not (is_gm or is_owner):
+            return {
+                'session_id': result.get('session_id'),
+                'actor_id': actor_id,
+                'action_type': result.get('action_type'),
+                'action_key': result.get('action_key'),
+                'advantage_mode': result.get('advantage_mode'),
+                'visibility_mode': visibility_mode,
+                'revision': result.get('revision'),
+            }
+        return result
+
+    def _roll_response_for_command(
+        self,
+        session: dict[str, Any],
+        canonical_result: dict[str, Any],
+        command: CommandContext | None,
+    ) -> dict[str, Any]:
+        filtered = self._filter_roll_result_for_view(session, canonical_result, command)
+        response = dict(filtered)
+        authoritative_payload = canonical_result.get('_authoritative_event_payload', {})
+        response['_authoritative_event_payload'] = dict(authoritative_payload) if isinstance(authoritative_payload, dict) else {}
+        return response
+
+    @staticmethod
+    def _skill_proficiency_multiplier(raw_tier: str | int | float) -> float:
+        if isinstance(raw_tier, (int, float)):
+            return float(raw_tier)
+        tier = str(raw_tier).strip().lower()
+        if tier == 'none':
+            return 0.0
+        if tier == 'half_proficient':
+            return 0.5
+        if tier == 'proficient':
+            return 1.0
+        if tier in {'expertise', 'expert'}:
+            return 2.0
+        return 0.0
 
     def set_notes(self, session_id: str, notes: str, command: CommandContext | None = None) -> dict[str, Any] | None:
         session = self.sessions.get(session_id)
@@ -1181,6 +1615,133 @@ class SessionService:
             'revision': self._current_revision(session_id),
         }
 
+    def install_module_pack(
+        self,
+        session_id: str,
+        manifest: dict[str, Any],
+        checksum_sha256: str,
+        *,
+        signature_hmac_sha256: str | None = None,
+        command: CommandContext | None = None,
+    ) -> dict[str, Any] | None:
+        session = self.sessions.get(session_id)
+        if not session:
+            return None
+        parsed_manifest = InstallablePackManifest.model_validate(manifest).model_dump()
+        canonical = self._canonical_json_bytes(manifest)
+        computed = hashlib.sha256(canonical).hexdigest()
+        if computed != checksum_sha256:
+            raise SessionPermissionError('Pack checksum mismatch')
+        self._register_idempotency_payload_hash(session_id, command, computed)
+        cached = self._prepare_mutation(session_id, command, resource='plugin')
+        if cached is not None:
+            return cached
+        secret = get_backup_signing_secret()
+        if secret:
+            if not signature_hmac_sha256:
+                raise SessionPermissionError('Pack signature required')
+            expected_signature = compute_backup_signature(secret, canonical)
+            if not hmac.compare_digest(expected_signature, signature_hmac_sha256):
+                raise SessionPermissionError('Pack signature mismatch')
+
+        campaign = self._campaign_for_session(session_id)
+        now = datetime.now(timezone.utc).isoformat()
+
+        for scene in parsed_manifest.get('scenes', []):
+            self._upsert_by_key(campaign.setdefault('encounter_templates', []), 'template_name', dict(scene))
+        for actor in parsed_manifest.get('actors', []):
+            self._upsert_by_key(session.setdefault('characters', []), 'actor_id', dict(actor))
+        for journal in parsed_manifest.get('journals', []):
+            self._upsert_by_key(campaign.setdefault('journal_entries', []), 'entry_id', dict(journal))
+        for handout in parsed_manifest.get('handouts', []):
+            self._upsert_by_key(campaign.setdefault('handouts', []), 'handout_id', dict(handout))
+        for macro in parsed_manifest.get('macros', []):
+            self._upsert_by_key(campaign.setdefault('macros', []), 'macro_id', dict(macro))
+        for template in parsed_manifest.get('templates', []):
+            self._upsert_by_key(campaign.setdefault('roll_templates', []), 'roll_template_id', dict(template))
+        for asset in parsed_manifest.get('assets', []):
+            self._upsert_by_key(campaign.setdefault('asset_library', []), 'asset_id', dict(asset))
+        for plugin in parsed_manifest.get('plugins', []):
+            plugin_payload = dict(plugin)
+            plugin_payload.setdefault('plugin_id', f"pack-plugin-{plugin_payload.get('name', 'unknown').lower()}")
+            self._upsert_by_key(campaign.setdefault('plugins', []), 'plugin_id', plugin_payload)
+
+        module_entry = {
+            'module_id': parsed_manifest['pack_id'],
+            'name': parsed_manifest['pack_name'],
+            'version': parsed_manifest['version'],
+            'description': parsed_manifest.get('description', ''),
+            'checksum_sha256': checksum_sha256,
+            'enabled': True,
+            'installed_at': now,
+            'updated_at': now,
+            'manifest': parsed_manifest,
+        }
+        self._upsert_by_key(campaign.setdefault('modules', []), 'module_id', module_entry)
+        enabled_modules = session.setdefault('enabled_modules', [])
+        if parsed_manifest['pack_id'] not in enabled_modules:
+            enabled_modules.append(parsed_manifest['pack_id'])
+        self._increment_revision(session_id)
+        result = {
+            'session_id': session_id,
+            'module': module_entry,
+            'revision': self._current_revision(session_id),
+        }
+        self._cache_result(session_id, command, result)
+        return result
+
+    def list_modules(self, session_id: str, command: CommandContext | None = None) -> list[dict[str, Any]] | None:
+        session = self.sessions.get(session_id)
+        if not session:
+            return None
+        self._ensure_metadata(session_id)
+        campaign = self._campaign_for_session(session_id)
+        enabled = set(session.get('enabled_modules', []))
+        modules: list[dict[str, Any]] = []
+        for module in campaign.get('modules', []):
+            if not isinstance(module, dict):
+                continue
+            entry = dict(module)
+            module_id = entry.get('module_id')
+            entry['enabled'] = isinstance(module_id, str) and module_id in enabled
+            modules.append(entry)
+        return modules
+
+    def set_module_enabled(
+        self,
+        session_id: str,
+        module_id: str,
+        enabled: bool,
+        command: CommandContext | None = None,
+    ) -> dict[str, Any] | None:
+        session = self.sessions.get(session_id)
+        if not session:
+            return None
+        cached = self._prepare_mutation(session_id, command, resource='plugin')
+        if cached is not None:
+            return cached
+        campaign = self._campaign_for_session(session_id)
+        modules = campaign.get('modules', [])
+        target = next((module for module in modules if module.get('module_id') == module_id), None)
+        if target is None:
+            raise SessionPermissionError('Module not found')
+        enabled_modules = session.setdefault('enabled_modules', [])
+        if enabled and module_id not in enabled_modules:
+            enabled_modules.append(module_id)
+        if not enabled:
+            session['enabled_modules'] = [value for value in enabled_modules if value != module_id]
+        target['enabled'] = enabled
+        target['updated_at'] = datetime.now(timezone.utc).isoformat()
+        self._increment_revision(session_id)
+        result = {
+            'session_id': session_id,
+            'module_id': module_id,
+            'enabled': enabled,
+            'revision': self._current_revision(session_id),
+        }
+        self._cache_result(session_id, command, result)
+        return result
+
     def get_state(self, session_id: str, command: CommandContext | None = None) -> dict[str, Any] | None:
         engine = self.get_engine(session_id)
         if not engine:
@@ -1189,6 +1750,58 @@ class SessionService:
         if session and not self._is_known_peer(session, command):
             return None
         return self._filter_state_for_view(session_id, self._state_with_revision(session_id), command)
+
+    def send_chat_message(
+        self,
+        session_id: str,
+        *,
+        content: str,
+        kind: str,
+        visibility_mode: str,
+        whisper_targets: list[str],
+        command: CommandContext | None = None,
+    ) -> dict[str, Any] | None:
+        session = self.sessions.get(session_id)
+        if not session:
+            return None
+        normalized = self._normalize_command(command)
+        validated = CommandContext(
+            actor_peer_id=normalized.actor_peer_id,
+            actor_token=normalized.actor_token,
+            actor_role=normalized.actor_role,
+            expected_revision=normalized.expected_revision,
+            idempotency_key=None,
+        )
+        cached = self._prepare_mutation(session_id, validated, resource='chat')
+        if cached is not None:
+            return cached
+        chat_idempotency_key = self._chat_idempotency_cache_key(command)
+        if chat_idempotency_key[0]:
+            self._ensure_metadata(session_id)
+            cached_chat = session.get('chat_idempotency_results', {}).get(chat_idempotency_key)
+            if isinstance(cached_chat, dict):
+                return cached_chat
+        sender_peer_id = normalized.actor_peer_id
+        filtered_targets = [peer_id for peer_id in whisper_targets if peer_id in session.get('peers', [])]
+        if kind == 'whisper' and not filtered_targets:
+            raise SessionPermissionError('Whisper requires at least one valid target')
+        self._increment_revision(session_id)
+        result = {
+            'session_id': session_id,
+            'message_id': secrets.token_hex(8),
+            'sender_peer_id': sender_peer_id,
+            'kind': kind,
+            'content': content,
+            'visibility_mode': visibility_mode,
+            'whisper_targets': filtered_targets,
+            'revision': self._current_revision(session_id),
+        }
+        if chat_idempotency_key[0]:
+            self._ensure_metadata(session_id)
+            session['chat_idempotency_results'][chat_idempotency_key] = result
+        else:
+            self._cache_result(session_id, command, result)
+        return result
 
     def assign_actor_owner(self, session_id: str, actor_id: str, peer_id: str, command: CommandContext | None = None) -> dict[str, Any] | None:
         session = self.sessions.get(session_id)
@@ -1309,6 +1922,8 @@ class SessionService:
 
         self.engines[session_id] = GameStateEngine.from_snapshot(snapshot)
         self.sessions[session_id] = session
+        self.sessions[session_id].setdefault('schema_version', MIN_SUPPORTED_SCHEMA_VERSION)
+        self.sessions[session_id].setdefault('migration_history', [])
         campaign_id = str(session.get('campaign_id', session_id))
         self.campaigns[campaign_id] = campaign
         self._ensure_metadata(session_id)
@@ -1355,6 +1970,26 @@ class SessionService:
                 deleted += 1
         return {'kept': len(to_keep), 'deleted': deleted}
 
+    def prune_backups_by_age(self, session_id: str, max_age_days: int) -> dict[str, int]:
+        backups = self.list_backups(session_id)
+        now = datetime.now(timezone.utc)
+        deleted = 0
+        kept = 0
+        for backup in backups:
+            created_at = str(backup.get('created_at', ''))
+            backup_path = Path(backup['backup_path'])
+            try:
+                created_dt = datetime.fromisoformat(created_at)
+            except ValueError:
+                created_dt = now
+            age_days = (now - created_dt).days
+            if age_days > max_age_days and backup_path.exists():
+                backup_path.unlink()
+                deleted += 1
+            else:
+                kept += 1
+        return {'kept': kept, 'deleted': deleted}
+
     def export_backup(self, session_id: str, backup_id: str) -> dict[str, Any] | None:
         backup_path = self.store.base_dir / 'backups' / f'{backup_id}.json'
         if not backup_path.exists():
@@ -1364,15 +1999,37 @@ class SessionService:
             raise SessionPermissionError('Backup does not match session id')
         canonical = json.dumps(backup, sort_keys=True, separators=(',', ':')).encode('utf-8')
         checksum = hashlib.sha256(canonical).hexdigest()
-        return {'backup': backup, 'checksum_sha256': checksum}
+        exported: dict[str, Any] = {'backup': backup, 'checksum_sha256': checksum}
+        secret = get_backup_signing_secret()
+        if secret:
+            exported['signature_hmac_sha256'] = compute_backup_signature(secret, canonical)
+        return exported
 
-    def import_backup(self, session_id: str, backup: dict[str, Any], checksum_sha256: str) -> dict[str, Any]:
+    def import_backup(
+        self,
+        session_id: str,
+        backup: dict[str, Any],
+        checksum_sha256: str,
+        signature_hmac_sha256: str | None = None,
+    ) -> dict[str, Any]:
         if str(backup.get('session_id')) != session_id:
             raise SessionPermissionError('Backup does not match session id')
         canonical = json.dumps(backup, sort_keys=True, separators=(',', ':')).encode('utf-8')
+        max_import_backup_bytes = get_backup_import_max_bytes()
+        if len(canonical) > max_import_backup_bytes:
+            raise SessionPermissionError(
+                f'Backup import payload too large ({len(canonical)} bytes > {max_import_backup_bytes} bytes)'
+            )
         computed = hashlib.sha256(canonical).hexdigest()
         if computed != checksum_sha256:
             raise SessionPermissionError('Backup checksum mismatch')
+        secret = get_backup_signing_secret()
+        if secret:
+            if not signature_hmac_sha256:
+                raise SessionPermissionError('Backup signature required')
+            expected_signature = compute_backup_signature(secret, canonical)
+            if not hmac.compare_digest(expected_signature, signature_hmac_sha256):
+                raise SessionPermissionError('Backup signature mismatch')
         backup_dir = self.store.base_dir / 'backups'
         backup_dir.mkdir(parents=True, exist_ok=True)
         imported_backup_id = f'{session_id}-{datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")}-{secrets.token_hex(3)}'
@@ -1439,11 +2096,25 @@ class SessionService:
                 'idempotency_results': {},
                 'actor_owners': {},
                 'peer_tokens': {'loaded-host': secrets.token_urlsafe(24)},
+                'schema_version': CURRENT_SCHEMA_VERSION,
+                'migration_history': [],
             }
         else:
             self._ensure_metadata(session_id)
+            self.sessions[session_id].setdefault('schema_version', MIN_SUPPORTED_SCHEMA_VERSION)
+            self.sessions[session_id].setdefault('migration_history', [])
         self._ensure_campaign(str(self.sessions[session_id].get('campaign_id', session_id)))
         return engine.snapshot()
+
+    def migrate_session(self, session_id: str, *, dry_run: bool) -> dict[str, Any] | None:
+        session = self.sessions.get(session_id)
+        if session is None:
+            return None
+        self._ensure_metadata(session_id)
+        result = run_session_migrations(session, dry_run=dry_run)
+        result['session_id'] = session_id
+        result['dry_run'] = dry_run
+        return result
 
     def get_tutorial(self, tutorial_path: str = 'packs/starter/tutorials/dm_tutorial_map.json') -> dict[str, Any]:
         tutorial = load_tutorial(tutorial_path)

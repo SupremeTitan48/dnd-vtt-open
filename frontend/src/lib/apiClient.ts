@@ -6,16 +6,25 @@ import type {
   JournalEntry,
   Macro,
   MacroExecution,
+  ModulePack,
   Plugin,
   RollTemplate,
   RollTemplateRender,
   Session,
   SessionEvent,
+  ChatMessage,
   Snapshot,
   Tutorial,
 } from "../types";
+import { getDesktopConfigSync } from "./desktopBridge";
 
-const API_BASE = "/api";
+function getApiBase(): string {
+  const desktopApiBase = getDesktopConfigSync()?.apiBaseUrl;
+  if (desktopApiBase) return desktopApiBase;
+  const envBase = import.meta.env.VITE_API_BASE_URL;
+  if (typeof envBase === "string" && envBase.trim()) return envBase.trim();
+  return "/api";
+}
 export type CommandContext = {
   actor_peer_id?: string;
   actor_token?: string;
@@ -28,6 +37,8 @@ export type ReadContext = {
   actor_token?: string;
   actor_role?: "GM" | "AssistantGM" | "Player" | "Observer";
 };
+export type RollVisibilityMode = "public" | "private" | "gm_only";
+export type ChatKind = "ic" | "ooc" | "emote" | "system" | "whisper" | "roll";
 export type JoinSessionResponse = {
   session_id: string;
   peers: string[];
@@ -59,7 +70,7 @@ function appendReadContext(path: string, context?: ReadContext): string {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const resp = await fetch(`${API_BASE}${path}`, {
+  const resp = await fetch(`${getApiBase()}${path}`, {
     headers: { "Content-Type": "application/json" },
     ...init,
   });
@@ -169,10 +180,54 @@ export function updateActor(
   addItem?: string,
   addCondition?: string,
   command?: CommandContext,
+  extras?: {
+    armor_class?: number;
+    max_hit_points?: number;
+    current_hit_points?: number;
+    concentration?: boolean;
+    saves?: Record<string, number>;
+    skills?: Record<string, { modifier: number; proficiency: string }>;
+    spell_slots?: Record<string, { max: number; current: number }>;
+    inventory_add?: string;
+    inventory_remove?: string;
+  },
 ): Promise<{ session_id: string; state: Snapshot }> {
   return request(`/sessions/${sessionId}/actor-state`, {
     method: "POST",
-    body: JSON.stringify({ actor_id: actorId, hit_points: hitPoints, add_item: addItem, add_condition: addCondition, command }),
+    body: JSON.stringify({ actor_id: actorId, hit_points: hitPoints, add_item: addItem, add_condition: addCondition, ...(extras ?? {}), command }),
+  });
+}
+
+export function rollSheetAction(
+  sessionId: string,
+  payload: {
+    actor_id: string;
+    action_type: "ability" | "save" | "skill" | "attack" | "spell";
+    action_key: string;
+    advantage_mode: "normal" | "advantage" | "disadvantage";
+    visibility_mode: RollVisibilityMode;
+  },
+  command?: CommandContext,
+): Promise<{ formula?: string; total?: number; revision: number; actor_id: string; visibility_mode: RollVisibilityMode }> {
+  return request(`/sessions/${sessionId}/sheet-actions/roll`, {
+    method: "POST",
+    body: JSON.stringify({ ...payload, command }),
+  });
+}
+
+export function sendChatMessage(
+  sessionId: string,
+  payload: {
+    content: string;
+    kind: ChatKind;
+    visibility_mode: RollVisibilityMode;
+    whisper_targets: string[];
+  },
+  command?: CommandContext,
+): Promise<ChatMessage> {
+  return request(`/sessions/${sessionId}/chat/messages`, {
+    method: "POST",
+    body: JSON.stringify({ ...payload, command }),
   });
 }
 
@@ -190,6 +245,18 @@ export function revealCell(
   command?: CommandContext,
 ): Promise<{ session_id: string; state: Snapshot }> {
   return request(`/sessions/${sessionId}/reveal-cell`, {
+    method: "POST",
+    body: JSON.stringify({ x, y, command }),
+  });
+}
+
+export function hideCell(
+  sessionId: string,
+  x: number,
+  y: number,
+  command?: CommandContext,
+): Promise<{ session_id: string; state: Snapshot }> {
+  return request(`/sessions/${sessionId}/hide-cell`, {
     method: "POST",
     body: JSON.stringify({ x, y, command }),
   });
@@ -428,6 +495,34 @@ export function setTokenVisionRadius(
   });
 }
 
+export function setTokenLight(
+  sessionId: string,
+  payload: {
+    token_id: string;
+    bright_radius: number;
+    dim_radius: number;
+    color: string;
+    enabled: boolean;
+  },
+  command?: CommandContext,
+): Promise<{ session_id: string; state: Snapshot }> {
+  return request(`/sessions/${sessionId}/token-light`, {
+    method: "POST",
+    body: JSON.stringify({ ...payload, command }),
+  });
+}
+
+export function setSceneLighting(
+  sessionId: string,
+  preset: "day" | "dim" | "night",
+  command?: CommandContext,
+): Promise<{ session_id: string; state: Snapshot }> {
+  return request(`/sessions/${sessionId}/scene-lighting`, {
+    method: "POST",
+    body: JSON.stringify({ preset, command }),
+  });
+}
+
 export function listMacros(sessionId: string, context?: ReadContext): Promise<{ session_id: string; macros: Macro[] }> {
   return request(appendReadContext(`/sessions/${sessionId}/macros`, context));
 }
@@ -512,5 +607,65 @@ export function executePluginHook(
   return request(`/sessions/${sessionId}/plugins/${pluginId}/hooks/${hookName}/execute`, {
     method: "POST",
     body: JSON.stringify({ payload, command }),
+  });
+}
+
+async function sha256Hex(value: string): Promise<string> {
+  const bytes = new TextEncoder().encode(value);
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(digest))
+    .map((item) => item.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+function toCanonicalJson(value: unknown): string {
+  const normalize = (input: unknown): unknown => {
+    if (Array.isArray(input)) return input.map(normalize);
+    if (input && typeof input === "object") {
+      const obj = input as Record<string, unknown>;
+      const sortedKeys = Object.keys(obj).sort();
+      const normalized: Record<string, unknown> = {};
+      for (const key of sortedKeys) normalized[key] = normalize(obj[key]);
+      return normalized;
+    }
+    return input;
+  };
+  return JSON.stringify(normalize(value));
+}
+
+export function listModules(sessionId: string, context?: ReadContext): Promise<{ session_id: string; modules: ModulePack[] }> {
+  return request(appendReadContext(`/sessions/${sessionId}/modules`, context));
+}
+
+export async function installModulePack(
+  sessionId: string,
+  manifestJson: string,
+  command?: CommandContext,
+): Promise<{ session_id: string; module: ModulePack; revision: number }> {
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(manifestJson) as Record<string, unknown>;
+  } catch {
+    throw new Error("Manifest must be valid JSON");
+  }
+  const normalized = toCanonicalJson(parsed);
+  const checksum = await sha256Hex(normalized);
+  return request(`/sessions/${sessionId}/modules/install`, {
+    method: "POST",
+    body: JSON.stringify({ manifest: parsed, checksum_sha256: checksum, command }),
+  });
+}
+
+export function enableModule(sessionId: string, moduleId: string, command?: CommandContext): Promise<{ session_id: string; revision: number }> {
+  return request(`/sessions/${sessionId}/modules/${moduleId}/enable`, {
+    method: "POST",
+    body: JSON.stringify({ command }),
+  });
+}
+
+export function disableModule(sessionId: string, moduleId: string, command?: CommandContext): Promise<{ session_id: string; revision: number }> {
+  return request(`/sessions/${sessionId}/modules/${moduleId}/disable`, {
+    method: "POST",
+    body: JSON.stringify({ command }),
   });
 }

@@ -43,6 +43,8 @@ _RULES: dict[tuple[Resource, Action], PermissionRule] = {
     ('roll_template', 'mutate'): PermissionRule(allowed_roles=frozenset({'GM', 'AssistantGM'})),
     ('plugin', 'read'): PermissionRule(allowed_roles=frozenset({'GM', 'AssistantGM'})),
     ('plugin', 'mutate'): PermissionRule(allowed_roles=frozenset({'GM', 'AssistantGM'})),
+    ('chat', 'read'): PermissionRule(allowed_roles=frozenset({'GM', 'AssistantGM', 'Player', 'Observer'})),
+    ('chat', 'mutate'): PermissionRule(allowed_roles=frozenset({'GM', 'AssistantGM', 'Player', 'Observer'})),
 }
 
 

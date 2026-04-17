@@ -38,6 +38,9 @@ class GameStateEngine:
     def reveal_cell(self, x: int, y: int) -> None:
         self.map_state.reveal_cell(x, y)
 
+    def hide_cell(self, x: int, y: int) -> None:
+        self.map_state.hide_cell(x, y)
+
     def paint_terrain(self, x: int, y: int, terrain_type: str) -> None:
         self.map_state.paint_terrain(x, y, terrain_type)
 
@@ -52,6 +55,29 @@ class GameStateEngine:
 
     def set_token_vision_radius(self, token_id: str, radius: int) -> set[tuple[int, int]]:
         return self.map_state.set_token_vision_radius(token_id, radius)
+
+    def set_token_vision_mode(self, token_id: str, vision_mode: str) -> None:
+        self.map_state.set_token_vision_mode(token_id, vision_mode)
+
+    def set_token_light(
+        self,
+        token_id: str,
+        *,
+        bright_radius: int,
+        dim_radius: int,
+        color: str,
+        enabled: bool,
+    ) -> None:
+        self.map_state.set_token_light(
+            token_id,
+            bright_radius=bright_radius,
+            dim_radius=dim_radius,
+            color=color,
+            enabled=enabled,
+        )
+
+    def set_scene_lighting(self, preset: str) -> None:
+        self.map_state.set_scene_lighting_preset(preset)
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -69,6 +95,9 @@ class GameStateEngine:
                     for token_id, cells in self.map_state.visibility_cells_by_token.items()
                 },
                 "vision_radius_by_token": self.map_state.vision_radius_by_token,
+                "vision_mode_by_token": self.map_state.vision_mode_by_token,
+                "token_light_by_token": self.map_state.token_light_by_token,
+                "scene_lighting_preset": self.map_state.scene_lighting_preset,
             },
             "combat": {
                 "initiative_order": self.combat_tracker.initiative_order,
@@ -112,6 +141,21 @@ class GameStateEngine:
             token_id: int(radius)
             for token_id, radius in map_data.get("vision_radius_by_token", {}).items()
         }
+        engine.map_state.vision_mode_by_token = {
+            token_id: str(mode)
+            for token_id, mode in map_data.get("vision_mode_by_token", {}).items()
+        }
+        engine.map_state.token_light_by_token = {
+            token_id: {
+                "bright_radius": int(light.get("bright_radius", 0)),
+                "dim_radius": int(light.get("dim_radius", 0)),
+                "color": str(light.get("color", "#ffffff")),
+                "enabled": bool(light.get("enabled", False)),
+            }
+            for token_id, light in map_data.get("token_light_by_token", {}).items()
+            if isinstance(light, dict)
+        }
+        engine.map_state.scene_lighting_preset = str(map_data.get("scene_lighting_preset", "day"))
 
         combat_data = data.get("combat", {})
         initiative = combat_data.get("initiative_order", [])

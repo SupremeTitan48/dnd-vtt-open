@@ -1,5 +1,8 @@
 from dataclasses import dataclass, field
 
+VISION_MODES = {"normal", "darkvision", "truesight"}
+SCENE_LIGHTING_PRESETS = {"day", "dim", "night"}
+
 
 @dataclass
 class MapState:
@@ -13,6 +16,9 @@ class MapState:
     asset_stamps: dict[tuple[int, int], str] = field(default_factory=dict)
     visibility_cells_by_token: dict[str, set[tuple[int, int]]] = field(default_factory=dict)
     vision_radius_by_token: dict[str, int] = field(default_factory=dict)
+    vision_mode_by_token: dict[str, str] = field(default_factory=dict)
+    token_light_by_token: dict[str, dict[str, int | str | bool]] = field(default_factory=dict)
+    scene_lighting_preset: str = "day"
     blocker_revision: int = 0
     _visibility_cache: dict[tuple[int, int, int, int], frozenset[tuple[int, int]]] = field(
         default_factory=dict
@@ -98,6 +104,10 @@ class MapState:
         self._validate_cell(x, y)
         self.revealed_cells.add((x, y))
 
+    def hide_cell(self, x: int, y: int) -> None:
+        self._validate_cell(x, y)
+        self.revealed_cells.discard((x, y))
+
     def paint_terrain(self, x: int, y: int, terrain_type: str) -> None:
         self._validate_cell(x, y)
         if terrain_type == "clear":
@@ -136,3 +146,36 @@ class MapState:
             raise ValueError("radius must be >= 0")
         self.vision_radius_by_token[token_id] = radius
         return self.recompute_visibility(token_id, radius)
+
+    def set_token_vision_mode(self, token_id: str, vision_mode: str) -> None:
+        normalized = vision_mode.strip().lower()
+        if normalized not in VISION_MODES:
+            raise ValueError(f"vision_mode must be one of {sorted(VISION_MODES)}")
+        self.vision_mode_by_token[token_id] = normalized
+
+    def set_token_light(
+        self,
+        token_id: str,
+        *,
+        bright_radius: int,
+        dim_radius: int,
+        color: str,
+        enabled: bool,
+    ) -> None:
+        if bright_radius < 0 or dim_radius < 0:
+            raise ValueError("light radii must be >= 0")
+        if bright_radius > dim_radius:
+            raise ValueError("bright_radius must be <= dim_radius")
+        normalized_color = color.strip() or "#ffffff"
+        self.token_light_by_token[token_id] = {
+            "bright_radius": int(bright_radius),
+            "dim_radius": int(dim_radius),
+            "color": normalized_color,
+            "enabled": bool(enabled),
+        }
+
+    def set_scene_lighting_preset(self, preset: str) -> None:
+        normalized = preset.strip().lower()
+        if normalized not in SCENE_LIGHTING_PRESETS:
+            raise ValueError(f"scene lighting preset must be one of {sorted(SCENE_LIGHTING_PRESETS)}")
+        self.scene_lighting_preset = normalized

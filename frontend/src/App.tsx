@@ -1,18 +1,26 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ActorPanel } from "./components/ActorPanel";
 import { CharacterImportPanel } from "./components/CharacterImportPanel";
+import { CharacterSheetPanel } from "./components/CharacterSheetPanel";
+import { ChatPanel } from "./components/ChatPanel";
+import { CommandPalette, type CommandItem } from "./components/CommandPalette";
 import { DMToolsPanel } from "./components/DMToolsPanel";
 import { HandoutPanel } from "./components/HandoutPanel";
 import { InitiativePanel } from "./components/InitiativePanel";
 import { JournalPanel } from "./components/JournalPanel";
+import { ExtensionsManagerPanel } from "./components/ExtensionsManagerPanel";
 import { MapCanvas } from "./components/MapCanvas";
-import { MapToolsPanel, type MapTool } from "./components/MapToolsPanel";
+import { MapToolsPanel, type FogMode, type MapTool } from "./components/MapToolsPanel";
 import { MacroPanel } from "./components/MacroPanel";
+import { OnboardingOverlay } from "./components/OnboardingOverlay";
 import { PermissionsPanel } from "./components/PermissionsPanel";
 import { PluginPanel } from "./components/PluginPanel";
 import { RollTemplatePanel } from "./components/RollTemplatePanel";
 import { SessionLobbyPanel } from "./components/SessionLobbyPanel";
+import { ShortcutsOverlay } from "./components/ShortcutsOverlay";
+import { StatusRail } from "./components/StatusRail";
 import { TutorialPanel } from "./components/TutorialPanel";
+import { AppShell } from "./components/layout/AppShell";
 import {
   addEncounterTemplate,
   addAssetLibraryItem,
@@ -25,19 +33,24 @@ import {
   type CommandContext,
   createSession,
   createSessionInCampaign,
+  disableModule,
+  enableModule,
   executePluginHook,
+  getEventReplayWithContext,
   getSession,
   getEncounterTemplates,
   getSessionNotes,
   getState,
   getTutorial,
   importCharacter,
+  installModulePack,
   joinSession,
   listAssets,
   listCharacters,
   listHandouts,
   listJournalEntries,
   listMacros,
+  listModules,
   listPlugins,
   listRollTemplates,
   loadSession,
@@ -45,14 +58,19 @@ import {
   nextTurn,
   paintTerrain,
   revealCell,
+  hideCell,
   saveSession,
   registerPlugin,
   renderRollTemplate,
+  rollSheetAction,
+  sendChatMessage,
   runMacro,
   setFog,
   setInitiative,
   setSessionNotes,
   setTokenVisionRadius,
+  setTokenLight,
+  setSceneLighting,
   shareHandout,
   shareJournalEntry,
   stampAsset,
@@ -62,7 +80,13 @@ import {
   updateActor,
 } from "./lib/apiClient";
 import { connectSessionEvents } from "./realtime/sessionRealtime";
-import type { AssetLibraryItem, CharacterSheet, EncounterTemplate, Handout, JournalEntry, Macro, Plugin, RollTemplate, Session, Snapshot, Tutorial } from "./types";
+import { getDesktopConfigSync, listenDesktopBackendStatus, type DesktopBackendStatus } from "./lib/desktopBridge";
+import { emitUxEvent } from "./lib/uxTelemetry";
+import { buildSessionIdHash, getRolePolicy, isActionAllowedForRole, type StatusKey } from "./lib/uxPolicy";
+import { addTokenToInitiative } from "./lib/combatUtils";
+import { getOnboardingSteps, getOnboardingStorageKey, isOnboardingStepComplete } from "./lib/onboardingModel";
+import type { AssetLibraryItem, CharacterSheet, EncounterTemplate, Handout, JournalEntry, Macro, ModulePack, Plugin, RollTemplate, Session, Snapshot, Tutorial } from "./types";
+import type { ChatMessage, SessionEvent } from "./types";
 
 const EMPTY_STATE: Snapshot = {
   map: {
@@ -76,6 +100,9 @@ const EMPTY_STATE: Snapshot = {
     asset_stamps: {},
     visibility_cells_by_token: {},
     vision_radius_by_token: {},
+    vision_mode_by_token: {},
+    token_light_by_token: {},
+    scene_lighting_preset: "day",
   },
   combat: { initiative_order: [], turn_index: 0, round_number: 1 },
   actors: {},
@@ -96,8 +123,15 @@ export default function App() {
   const [macros, setMacros] = useState<Macro[]>([]);
   const [rollTemplates, setRollTemplates] = useState<RollTemplate[]>([]);
   const [plugins, setPlugins] = useState<Plugin[]>([]);
+  const [modules, setModules] = useState<ModulePack[]>([]);
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [selectedTokens, setSelectedTokens] = useState<string[]>(["hero"]);
   const [contextMenu, setContextMenu] = useState<ContextMenuState>(null);
+  const [tokenHudAnchor, setTokenHudAnchor] = useState<{ tokenId: string; x: number; y: number } | null>(null);
+  const [openCommandPalette, setOpenCommandPalette] = useState(false);
+  const [openShortcuts, setOpenShortcuts] = useState(false);
+  const [showOnboarding, setShowOnboarding] = useState(false);
+  const [onboardingStepIndex, setOnboardingStepIndex] = useState(0);
   const [rulerPreset, setRulerPreset] = useState<{ start: { x: number; y: number }; end: { x: number; y: number }; nonce: number } | null>(
     null,
   );
@@ -106,19 +140,45 @@ export default function App() {
   const [assetId, setAssetId] = useState("tree");
   const [movementBudgetCells, setMovementBudgetCells] = useState(6);
   const [visionRadiusInput, setVisionRadiusInput] = useState(6);
+  const [selectedTokenLight, setSelectedTokenLight] = useState({
+    bright_radius: 0,
+    dim_radius: 0,
+    color: "#ffffff",
+    enabled: false,
+  });
   const [clearRulerSignal, setClearRulerSignal] = useState(0);
+  const [fogMode, setFogMode] = useState<FogMode>("reveal");
+  const [previewPlayerView, setPreviewPlayerView] = useState(false);
   const [status, setStatus] = useState("Starting session...");
   const [currentPeerId, setCurrentPeerId] = useState("dm-web");
   const [currentPeerToken, setCurrentPeerToken] = useState<string | undefined>(undefined);
   const [loadingSession, setLoadingSession] = useState(false);
+  const [desktopBackendStatus, setDesktopBackendStatus] = useState<DesktopBackendStatus | null>(() => {
+    const config = getDesktopConfigSync();
+    if (!config) return null;
+    return { state: config.backendState, message: config.backendMessage };
+  });
   const snapshotRevisionRef = useRef(0);
+  const [sessionIdHash, setSessionIdHash] = useState("nosession0000");
+
+  useEffect(() => {
+    const unsubscribe = listenDesktopBackendStatus((nextStatus) => {
+      setDesktopBackendStatus(nextStatus);
+    });
+    return () => {
+      if (unsubscribe) unsubscribe();
+    };
+  }, []);
 
   useEffect(() => {
     snapshotRevisionRef.current = snapshot.revision ?? 0;
   }, [snapshot]);
 
-  function readContext() {
-    return { actor_peer_id: currentPeerId, actor_token: currentPeerToken };
+  function readContext(overrides?: { actor_peer_id?: string; actor_token?: string }) {
+    return {
+      actor_peer_id: overrides?.actor_peer_id ?? currentPeerId,
+      actor_token: overrides?.actor_token ?? currentPeerToken,
+    };
   }
 
   const currentRole = useMemo<"GM" | "AssistantGM" | "Player" | "Observer">(() => {
@@ -128,8 +188,8 @@ export default function App() {
     return "Player";
   }, [session, currentPeerId]);
 
-  async function refreshSessionData(sessionId: string) {
-    const context = readContext();
+  async function refreshSessionData(sessionId: string, contextOverride?: { actor_peer_id?: string; actor_token?: string }) {
+    const context = readContext(contextOverride);
     const [sessionResp, stateResp, tutorialResp, notesResp, templatesResp, charsResp] = await Promise.all([
       getSession(sessionId, context),
       getState(sessionId, context),
@@ -138,10 +198,11 @@ export default function App() {
       getEncounterTemplates(sessionId, context),
       listCharacters(sessionId, context),
     ]);
-    const [journalResp, handoutsResp, assetsResp] = await Promise.all([
+    const [journalResp, handoutsResp, assetsResp, modulesResp] = await Promise.all([
       listJournalEntries(sessionId, context),
       listHandouts(sessionId, context),
       listAssets(sessionId, context),
+      listModules(sessionId, context),
     ]);
     const role =
       (sessionResp.peer_roles && sessionResp.peer_roles[currentPeerId]) ||
@@ -155,10 +216,12 @@ export default function App() {
       setMacros(macrosResp.macros);
       setRollTemplates(rollTemplatesResp.roll_templates);
       setPlugins(pluginsResp.plugins);
+      setModules(modulesResp.modules);
     } else {
       setMacros([]);
       setRollTemplates([]);
       setPlugins([]);
+      setModules(modulesResp.modules);
     }
     setSession(sessionResp);
     setSnapshot(stateResp.state);
@@ -169,6 +232,12 @@ export default function App() {
     setJournalEntries(journalResp.journal_entries);
     setHandouts(handoutsResp.handouts);
     setAssetLibrary(assetsResp.assets);
+    const replay = await getEventReplayWithContext(sessionId, 0, context);
+    const initialMessages = replay.events
+      .filter((event) => event.event_type === "chat_message")
+      .map((event) => ({ ...(event.payload as ChatMessage), revision: event.revision }))
+      .filter((message) => typeof message.message_id === "string");
+    setChatMessages(initialMessages);
     setStatus(`Active session: ${sessionResp.session_name} as ${currentPeerId}`);
   }
 
@@ -181,13 +250,33 @@ export default function App() {
   }
 
   const canMutate = currentRole !== "Observer";
-  const canUseGMTools = currentRole === "GM" || currentRole === "AssistantGM";
+  const isHostAdmin = session ? currentPeerId === session.host_peer_id : false;
+  const rolePolicy = useMemo(() => getRolePolicy(currentRole, isHostAdmin), [currentRole, isHostAdmin]);
+  const canUseGMTools = isActionAllowedForRole(rolePolicy, "useAdvancedMapTools");
+  const canMutateWithPolicy = isActionAllowedForRole(rolePolicy, "mutateSession");
   const canEditMap = canUseGMTools;
   const visibilityMaskActive = !canUseGMTools && Object.keys(snapshot.map.visibility_cells_by_token ?? {}).length > 0;
   const ownedActorIds = useMemo(() => new Set(Object.keys(snapshot.actors)), [snapshot.actors]);
 
+  useEffect(() => {
+    if (!session) {
+      setSessionIdHash("nosession0000");
+      return;
+    }
+    const salt = String(import.meta.env.VITE_TELEMETRY_SALT ?? "dev-salt");
+    void buildSessionIdHash(salt, session.session_id).then((hash) => setSessionIdHash(hash));
+  }, [session]);
+
+  useEffect(() => {
+    if (!session) return;
+    const key = getOnboardingStorageKey(currentPeerId, currentRole);
+    const done = window.localStorage.getItem(key) === "done";
+    setShowOnboarding(!done);
+    setOnboardingStepIndex(0);
+  }, [session, currentPeerId, currentRole]);
+
   function canControlToken(tokenId: string): boolean {
-    if (!canMutate) return false;
+    if (!canMutateWithPolicy) return false;
     if (canUseGMTools) return true;
     return ownedActorIds.has(tokenId);
   }
@@ -198,7 +287,7 @@ export default function App() {
       const created = await createSession(sessionName, hostPeerId);
       setCurrentPeerId(hostPeerId);
       setCurrentPeerToken(created.host_peer_token);
-      await refreshSessionData(created.session_id);
+      await refreshSessionData(created.session_id, { actor_peer_id: hostPeerId, actor_token: created.host_peer_token });
     } catch (err) {
       setStatus(`Host error: ${(err as Error).message}`);
     } finally {
@@ -212,7 +301,7 @@ export default function App() {
       const created = await createSessionInCampaign(sessionName, hostPeerId, campaignId);
       setCurrentPeerId(hostPeerId);
       setCurrentPeerToken(created.host_peer_token);
-      await refreshSessionData(created.session_id);
+      await refreshSessionData(created.session_id, { actor_peer_id: hostPeerId, actor_token: created.host_peer_token });
     } catch (err) {
       setStatus(`Host error: ${(err as Error).message}`);
     } finally {
@@ -226,7 +315,7 @@ export default function App() {
       const joined = await joinSession(sessionId, peerId);
       setCurrentPeerId(peerId);
       setCurrentPeerToken(joined.peer_token);
-      await refreshSessionData(sessionId);
+      await refreshSessionData(sessionId, { actor_peer_id: peerId, actor_token: joined.peer_token });
     } catch (err) {
       setStatus(`Join error: ${(err as Error).message}`);
     } finally {
@@ -243,6 +332,15 @@ export default function App() {
       {
         onSnapshot: setSnapshot,
         onCharacters: setCharacters,
+        onEvent: (event: SessionEvent) => {
+          if (event.event_type !== "chat_message") return;
+          const payload = event.payload as ChatMessage;
+          if (!payload || typeof payload.message_id !== "string") return;
+          setChatMessages((prev) => {
+            if (prev.some((m) => m.message_id === payload.message_id && m.revision === event.revision)) return prev;
+            return [...prev, { ...payload, revision: event.revision }];
+          });
+        },
         onStatus: setStatus,
       },
     );
@@ -253,7 +351,7 @@ export default function App() {
   useEffect(() => {
     function onKeydown(e: KeyboardEvent) {
       if (!session || activeTool !== "move") return;
-      if (!canMutate) return;
+      if (!canMutateWithPolicy) return;
       if (!["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(e.key)) return;
       e.preventDefault();
       void (async () => {
@@ -272,7 +370,7 @@ export default function App() {
 
     window.addEventListener("keydown", onKeydown);
     return () => window.removeEventListener("keydown", onKeydown);
-  }, [session, selectedTokens, snapshot, activeTool, canMutate, currentPeerId, currentRole]);
+  }, [session, selectedTokens, snapshot, activeTool, canMutateWithPolicy, currentPeerId, currentRole]);
 
   useEffect(() => {
     function closeMenu() {
@@ -280,6 +378,27 @@ export default function App() {
     }
     window.addEventListener("click", closeMenu);
     return () => window.removeEventListener("click", closeMenu);
+  }, []);
+
+  useEffect(() => {
+    function onKeydown(e: KeyboardEvent) {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        setOpenCommandPalette((prev) => !prev);
+        return;
+      }
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "s") {
+        e.preventDefault();
+        void handleSave();
+        return;
+      }
+      if (e.key === "?") {
+        e.preventDefault();
+        setOpenShortcuts((prev) => !prev);
+      }
+    }
+    window.addEventListener("keydown", onKeydown);
+    return () => window.removeEventListener("keydown", onKeydown);
   }, []);
 
   const tokenIds = useMemo(() => {
@@ -301,7 +420,7 @@ export default function App() {
 
   async function handleMoveTokens(tokenIdsToMove: string[], toX: number, toY: number) {
     if (!session || tokenIdsToMove.length === 0) return;
-    if (!canMutate) return;
+    if (!canMutateWithPolicy) return;
     const controllableTokens = tokenIdsToMove.filter((tokenId) => canControlToken(tokenId));
     if (!controllableTokens.length) return;
     const lead = controllableTokens[0];
@@ -461,6 +580,48 @@ export default function App() {
     return resp.rendered;
   }
 
+  async function handleRollSheetAction(payload: {
+    actor_id: string;
+    action_type: "ability" | "save" | "skill" | "attack" | "spell";
+    action_key: string;
+    advantage_mode: "normal" | "advantage" | "disadvantage";
+    visibility_mode: "public" | "private" | "gm_only";
+  }) {
+    if (!session || !canMutateWithPolicy) return;
+    const result = await rollSheetAction(session.session_id, payload, commandContext());
+    setStatus(`Rolled ${payload.action_type}:${payload.action_key} => ${result.total ?? "hidden"} (${result.formula ?? "redacted"})`);
+  }
+
+  async function handleSendChatMessage(payload: {
+    content: string;
+    kind: "ic" | "ooc" | "emote" | "system" | "whisper" | "roll";
+    visibility_mode: "public" | "private" | "gm_only";
+    whisper_targets: string[];
+  }) {
+    if (!session || !canMutateWithPolicy) return;
+    const sent = await sendChatMessage(session.session_id, payload, commandContext());
+    setChatMessages((prev) => {
+      if (prev.some((m) => m.message_id === sent.message_id && m.revision === sent.revision)) return prev;
+      return [...prev, sent];
+    });
+  }
+
+  async function handleUpdateSheetState(
+    actorId: string,
+    updates: {
+      concentration?: boolean;
+      spell_slots?: Record<string, { max: number; current: number }>;
+      inventory_add?: string;
+      inventory_remove?: string;
+    },
+  ) {
+    if (!session || !canMutateWithPolicy) return;
+    const response = await updateActor(session.session_id, actorId, undefined, undefined, undefined, commandContext(), updates);
+    setSnapshot(response.state);
+    const chars = await listCharacters(session.session_id, readContext());
+    setCharacters(chars.characters);
+  }
+
   async function handleRegisterPlugin(name: string, version: string, capabilities: string[]) {
     if (!session || !canUseGMTools) return;
     await registerPlugin(session.session_id, name, version, capabilities, commandContext());
@@ -475,6 +636,27 @@ export default function App() {
     return resp.status;
   }
 
+  async function handleInstallModulePack(manifestJson: string) {
+    if (!session || !canUseGMTools) return;
+    await installModulePack(session.session_id, manifestJson, commandContext());
+    const modulesResp = await listModules(session.session_id, readContext());
+    setModules(modulesResp.modules);
+    await refreshSessionData(session.session_id);
+    setStatus("Module pack installed");
+  }
+
+  async function handleToggleModule(moduleId: string, enabled: boolean) {
+    if (!session || !canUseGMTools) return;
+    if (enabled) {
+      await enableModule(session.session_id, moduleId, commandContext());
+    } else {
+      await disableModule(session.session_id, moduleId, commandContext());
+    }
+    const modulesResp = await listModules(session.session_id, readContext());
+    setModules(modulesResp.modules);
+    setStatus(`Module ${enabled ? "enabled" : "disabled"}: ${moduleId}`);
+  }
+
   async function handleToggleFog() {
     if (!session) return;
     if (!canUseGMTools) return;
@@ -485,6 +667,12 @@ export default function App() {
   async function handleRevealCell(x: number, y: number) {
     if (!session || !snapshot.map.fog_enabled) return;
     if (!canUseGMTools) return;
+    if (fogMode === "rehide") {
+      const resp = await hideCell(session.session_id, x, y, commandContext());
+      setSnapshot(resp.state);
+      setStatus(`Re-hid ${x},${y}`);
+      return;
+    }
     const resp = await revealCell(session.session_id, x, y, commandContext());
     setSnapshot(resp.state);
   }
@@ -513,10 +701,51 @@ export default function App() {
   async function handleSetTokenVisionRadius() {
     if (!session || !canUseGMTools) return;
     if (!selectedLeadToken) return;
+    if (!snapshot.map.token_positions[selectedLeadToken]) {
+      setStatus(`Cannot set vision radius: token "${selectedLeadToken}" is not currently placed on the map.`);
+      return;
+    }
     const radius = Math.max(0, Math.floor(visionRadiusInput));
-    const resp = await setTokenVisionRadius(session.session_id, selectedLeadToken, radius, commandContext());
+    try {
+      const resp = await setTokenVisionRadius(session.session_id, selectedLeadToken, radius, commandContext());
+      setSnapshot(resp.state);
+      setStatus(`Set vision radius ${radius} for ${selectedLeadToken}`);
+    } catch (err) {
+      setStatus(`Set vision radius failed: ${(err as Error).message}`);
+    }
+  }
+
+  useEffect(() => {
+    const tokenLight = snapshot.map.token_light_by_token?.[selectedLeadToken];
+    if (!tokenLight) {
+      setSelectedTokenLight({ bright_radius: 0, dim_radius: 0, color: "#ffffff", enabled: false });
+      return;
+    }
+    setSelectedTokenLight(tokenLight);
+  }, [selectedLeadToken, snapshot.map.token_light_by_token]);
+
+  async function handleSetSceneLightingPreset(preset: "day" | "dim" | "night") {
+    if (!session || !canUseGMTools) return;
+    const resp = await setSceneLighting(session.session_id, preset, commandContext());
     setSnapshot(resp.state);
-    setStatus(`Set vision radius ${radius} for ${selectedLeadToken}`);
+    setStatus(`Scene lighting set to ${preset}`);
+  }
+
+  async function handleSetTokenLight(nextLight: { bright_radius: number; dim_radius: number; color: string; enabled: boolean }) {
+    if (!session || !canUseGMTools || !selectedLeadToken) return;
+    const resp = await setTokenLight(
+      session.session_id,
+      {
+        token_id: selectedLeadToken,
+        bright_radius: Math.max(0, Math.floor(nextLight.bright_radius)),
+        dim_radius: Math.max(0, Math.floor(nextLight.dim_radius)),
+        color: nextLight.color || "#ffffff",
+        enabled: Boolean(nextLight.enabled),
+      },
+      commandContext(),
+    );
+    setSnapshot(resp.state);
+    setSelectedTokenLight(nextLight);
   }
 
   async function handleReorderInitiative(nextOrder: string[]) {
@@ -524,6 +753,29 @@ export default function App() {
     if (!canUseGMTools) return;
     const resp = await setInitiative(session.session_id, nextOrder, commandContext());
     setSnapshot(resp.state);
+  }
+
+  async function handleAddLeadTokenToInitiative() {
+    if (!session || !canUseGMTools) return;
+    const nextOrder = addTokenToInitiative(snapshot.combat.initiative_order, selectedLeadToken);
+    if (nextOrder === snapshot.combat.initiative_order) return;
+    const resp = await setInitiative(session.session_id, nextOrder, commandContext());
+    setSnapshot(resp.state);
+    setStatus(`Added ${selectedLeadToken} to initiative`);
+  }
+
+  async function handleHideAllFog() {
+    if (!session || !canUseGMTools) return;
+    if (!snapshot.map.fog_enabled) {
+      const resp = await setFog(session.session_id, true, commandContext());
+      setSnapshot(resp.state);
+    }
+    setStatus("Hide all enabled (fog on). Re-hide now persists via hide-cell.");
+  }
+
+  function handleFocusCombatant(tokenId: string) {
+    setSelectedTokens([tokenId]);
+    setStatus(`Focused combatant ${tokenId}`);
   }
 
   async function handleAssignRole(peerId: string, role: "GM" | "AssistantGM" | "Player" | "Observer") {
@@ -542,7 +794,7 @@ export default function App() {
 
   async function applyTokenQuickAction(action: "damage" | "heal" | "condition") {
     if (!session || !contextMenu) return;
-    if (!canMutate) return;
+    if (!canMutateWithPolicy) return;
     const tokenId = contextMenu.tokenId;
     if (!canControlToken(tokenId)) {
       setContextMenu(null);
@@ -597,10 +849,209 @@ export default function App() {
     setContextMenu(null);
   }
 
+  async function handleTokenHudAction(action: "open-sheet" | "damage" | "heal" | "condition" | "initiative" | "ping") {
+    if (!tokenHudAnchor) return;
+    if (action === "open-sheet") {
+      setStatus(`Opened details for ${tokenHudAnchor.tokenId}`);
+      return;
+    }
+    if (action === "initiative") {
+      if (!session || !canUseGMTools) return;
+      const nextOrder = addTokenToInitiative(snapshot.combat.initiative_order, tokenHudAnchor.tokenId);
+      const resp = await setInitiative(session.session_id, nextOrder, commandContext());
+      setSnapshot(resp.state);
+      setStatus(`Added ${tokenHudAnchor.tokenId} to initiative`);
+      return;
+    }
+    if (action === "ping") {
+      setStatus(`Pinged and focused ${tokenHudAnchor.tokenId}`);
+      return;
+    }
+    if (!session) return;
+    const actor = snapshot.actors[tokenHudAnchor.tokenId];
+    if (action === "damage") {
+      const resp = await updateActor(session.session_id, tokenHudAnchor.tokenId, Math.max(0, (actor?.hit_points ?? 1) - 3), undefined, undefined, commandContext());
+      setSnapshot(resp.state);
+      return;
+    }
+    if (action === "heal") {
+      const resp = await updateActor(session.session_id, tokenHudAnchor.tokenId, Math.max(0, (actor?.hit_points ?? 1) + 3), undefined, undefined, commandContext());
+      setSnapshot(resp.state);
+      return;
+    }
+    if (action === "condition") {
+      const resp = await updateActor(session.session_id, tokenHudAnchor.tokenId, undefined, undefined, "Marked", commandContext());
+      setSnapshot(resp.state);
+    }
+  }
+
+  const statusSignals = useMemo<StatusKey[]>(() => {
+    const signals: StatusKey[] = [];
+    const normalized = status.toLowerCase();
+    if (desktopBackendStatus?.state === "error") signals.push("backend unavailable");
+    if (normalized.includes("permission denied")) signals.push("permission denied");
+    if (normalized.includes("reconnect")) signals.push("reconnecting");
+    if (normalized.includes("sync")) signals.push("syncing");
+    if (normalized.includes("replay")) signals.push("replay available");
+    if (normalized.includes("saved")) signals.push("saved");
+    if (signals.length === 0) signals.push("connected");
+    return signals;
+  }, [status, desktopBackendStatus]);
+
+  const viewportMode = window.innerWidth >= 1360 ? "wideDesktop" : window.innerWidth >= 1024 ? "narrowDesktop" : window.innerWidth >= 900 ? "minSupportedWidth" : "unsupported";
+
+  const rightSections = [
+    {
+      id: "session",
+      title: "Session and Permissions",
+      content: (
+        <>
+          <SessionLobbyPanel onHostSession={handleHostSession} onJoinSession={handleJoinSession} loading={loadingSession} />
+          {isActionAllowedForRole(rolePolicy, "managePermissions") && (
+            <PermissionsPanel
+              peers={session?.peers ?? []}
+              peerRoles={session?.peer_roles ?? {}}
+              actorOwners={session?.actor_owners ?? {}}
+              actorIds={Object.keys(snapshot.actors)}
+              canManagePermissions
+              onAssignRole={handleAssignRole}
+              onAssignOwner={handleAssignOwner}
+            />
+          )}
+        </>
+      ),
+    },
+    {
+      id: "content",
+      title: "Content",
+      content: (
+        <>
+          <ActorPanel snapshot={snapshot} />
+          <CharacterSheetPanel
+            characters={characters}
+            canRoll={canMutateWithPolicy}
+            onRoll={handleRollSheetAction}
+            onUpdateSheet={handleUpdateSheetState}
+          />
+          <JournalPanel
+            entries={journalEntries}
+            peers={session?.peers ?? []}
+            canManage={canUseGMTools}
+            onCreate={handleCreateJournalEntry}
+            onUpdate={handleUpdateJournalEntry}
+            onShare={handleShareJournalEntry}
+          />
+          <HandoutPanel
+            handouts={handouts}
+            peers={session?.peers ?? []}
+            canManage={canUseGMTools}
+            onCreate={handleCreateHandout}
+            onUpdate={handleUpdateHandout}
+            onShare={handleShareHandout}
+          />
+          <TutorialPanel tutorial={tutorial} />
+        </>
+      ),
+    },
+    {
+      id: "gm-tools",
+      title: "GM and Admin",
+      content: (
+        <>
+          <CharacterImportPanel onImport={handleImport} canEdit={canUseGMTools} />
+          <DMToolsPanel notes={notes} templates={templates} onSaveNotes={handleSaveNotes} onAddTemplate={handleAddTemplate} canEdit={canUseGMTools} />
+          <MacroPanel macros={macros} canManage={canUseGMTools} onCreate={handleCreateMacro} onRun={handleRunMacro} />
+          <RollTemplatePanel
+            rollTemplates={rollTemplates}
+            canManage={canUseGMTools}
+            onCreate={handleCreateRollTemplate}
+            onRender={handleRenderRollTemplate}
+          />
+          <PluginPanel
+            plugins={plugins}
+            canManage={canUseGMTools}
+            onRegister={handleRegisterPlugin}
+            onExecuteHook={handleExecutePluginHook}
+          />
+          <ExtensionsManagerPanel modules={modules} canManage={canUseGMTools} onInstall={handleInstallModulePack} onToggle={handleToggleModule} />
+          <div className="panel side-panel">
+            <h3>Imported Characters</h3>
+            <ul className="list">
+              {characters.map((c) => (
+                <li key={`${c.name}-${c.level}`}>
+                  {c.name} (Lvl {c.level} {c.character_class})
+                </li>
+              ))}
+            </ul>
+          </div>
+        </>
+      ),
+    },
+  ];
+
+  const trayTabs = [
+    {
+      id: "combat",
+      title: "Combat",
+      content: <InitiativePanel snapshot={snapshot} onReorder={handleReorderInitiative} canEdit={canUseGMTools} onFocusCombatant={handleFocusCombatant} />,
+    },
+    {
+      id: "chat",
+      title: "Chat and Notes",
+      content: (
+        <ChatPanel messages={chatMessages} currentPeerId={currentPeerId} canPost={canMutateWithPolicy} onSend={handleSendChatMessage} />
+      ),
+    },
+  ];
+
+  const commandItems: CommandItem[] = [
+    { id: "next-turn", group: "Combat", label: "Next turn", run: () => void handleNextTurn() },
+    { id: "toggle-fog", group: "Map", label: "Toggle fog", run: () => void handleToggleFog() },
+    { id: "hide-all-fog", group: "Map", label: "Hide all fog", run: () => void handleHideAllFog() },
+    {
+      id: "toggle-player-preview",
+      group: "Map",
+      label: previewPlayerView ? "Exit player preview" : "Preview player view",
+      run: () => setPreviewPlayerView((prev) => !prev),
+    },
+    { id: "save-session", group: "Session", label: "Save session", shortcut: "Ctrl/Cmd+S", run: () => void handleSave() },
+    { id: "add-selected-initiative", group: "Combat", label: "Add selected token to initiative", run: () => void handleAddLeadTokenToInitiative() },
+    { id: "focus-selected-token", group: "Map", label: "Focus selected token", run: () => setStatus(`Focused token ${selectedLeadToken}`) },
+    { id: "show-shortcuts", group: "Help", label: "Show keyboard shortcuts", shortcut: "?", run: () => setOpenShortcuts(true) },
+    {
+      id: "replay-onboarding",
+      group: "Help",
+      label: "Replay onboarding",
+      run: () => {
+        setOnboardingStepIndex(0);
+        setShowOnboarding(true);
+      },
+    },
+  ];
+  const onboardingSteps = getOnboardingSteps(currentRole);
+  const onboardingSignals = {
+    hasSelectedToken: selectedTokens.length > 0,
+    hasUsedRuler: activeTool === "ruler" || rulerPreset !== null,
+    hasInitiativeEntry: snapshot.combat.initiative_order.length > 0,
+  };
+  const onboardingCanAdvance = isOnboardingStepComplete(currentRole, onboardingStepIndex, onboardingSignals);
+  const onboardingHint =
+    currentRole === "Player" && onboardingStepIndex === 3
+      ? "Complete this step by selecting a token and using the ruler at least once."
+      : (currentRole === "GM" || currentRole === "AssistantGM") && onboardingStepIndex === 3
+        ? "Complete this step by adding at least one token to initiative."
+        : undefined;
+
   if (!session) {
     return (
-      <div className="app-shell app-shell-single">
+      <div className="app-shell app-shell-single" data-theme="grimdark">
         <div className="left-stack">
+          {desktopBackendStatus && (
+            <div className="status-line">
+              <span className={`desktop-badge desktop-badge-${desktopBackendStatus.state}`}>Desktop backend: {desktopBackendStatus.state}</span>
+              {desktopBackendStatus.message ? ` (${desktopBackendStatus.message})` : ""}
+            </div>
+          )}
           <div className="status-line">{status}</div>
           <SessionLobbyPanel onHostSession={handleHostSession} onJoinSession={handleJoinSession} loading={loadingSession} />
           <TutorialPanel tutorial={tutorial} />
@@ -610,154 +1061,187 @@ export default function App() {
   }
 
   return (
-    <div className="app-shell">
-      <div className="left-stack">
-        <div className="panel toolbar">
-          <span className="token-chip">Peer: {currentPeerId}</span>
-          <span className="token-chip">Role: {currentRole}</span>
-          {visibilityMaskActive && <span className="token-chip">Visibility mask active</span>}
-          <span className="token-chip">Session: {session.session_id}</span>
-          {canUseGMTools && (
-            <>
-              <input
-                type="number"
-                min={0}
-                value={visionRadiusInput}
-                onChange={(e) => setVisionRadiusInput(Number(e.target.value))}
-                style={{ width: 72 }}
-              />
-              <button onClick={() => void handleSetTokenVisionRadius()}>Set Vision Radius</button>
-            </>
-          )}
-          <select value={selectedLeadToken} onChange={(e) => setSelectedTokens([e.target.value])}>
-            {tokenIds.map((tokenId) => (
-              <option key={tokenId} value={tokenId}>
-                {tokenId}
-              </option>
-            ))}
-          </select>
-          <button onClick={handleNextTurn} disabled={!canUseGMTools}>Next Turn</button>
-          <button onClick={handleSave}>Save Session</button>
-          <button onClick={handleLoad}>Load Session</button>
-          <button onClick={handleToggleFog} disabled={!canUseGMTools}>{snapshot.map.fog_enabled ? "Disable Fog" : "Enable Fog"}</button>
-          <span className="token-chip">Keyboard: Arrow keys</span>
-          <span className="token-chip">Mouse: Drag token(s)</span>
-          <span className="token-chip">Select: Shift/Cmd click</span>
-        </div>
-        <div className="status-line">{status}</div>
-        <MapCanvas
-          snapshot={snapshot}
-          selectedTokens={selectedTokens}
-          activeTool={activeTool}
-          terrainType={terrainType}
-          assetId={assetId}
-          onToggleToken={toggleTokenSelection}
-          onMoveTokens={handleMoveTokens}
-          onRevealCell={handleRevealCell}
-          onPaintTerrain={handlePaintTerrain}
-          onToggleBlocked={handleToggleBlocked}
-          onStampAsset={handleStampAsset}
-          onTokenContext={(target) => setContextMenu({ tokenId: target.tokenId, x: target.clientX, y: target.clientY })}
-          canEditMap={canEditMap}
-          canMoveTokens={canMutate}
-          canControlToken={canControlToken}
-          useVisibilityMask={!canUseGMTools}
-          movementBudgetCells={movementBudgetCells}
-          rulerPreset={rulerPreset}
-          clearRulerSignal={clearRulerSignal}
-        />
-      </div>
-      <div className="side-stack">
-        <SessionLobbyPanel onHostSession={handleHostSession} onJoinSession={handleJoinSession} loading={loadingSession} />
-        <button
-          disabled={loadingSession || !session.campaign_id}
-          onClick={() => void handleHostInCampaign("Reuse Campaign Session", currentPeerId, session.campaign_id ?? "")}
-        >
-          Host New Session In Campaign
-        </button>
-        <PermissionsPanel
-          peers={session.peers}
-          peerRoles={session.peer_roles ?? {}}
-          actorOwners={session.actor_owners ?? {}}
-          actorIds={Object.keys(snapshot.actors)}
-          canManagePermissions={canUseGMTools}
-          onAssignRole={handleAssignRole}
-          onAssignOwner={handleAssignOwner}
-        />
-        <MapToolsPanel
-          activeTool={activeTool}
-          terrainType={terrainType}
-          assetId={assetId}
-          assetOptions={assetLibrary.map((asset) => ({ asset_id: asset.asset_id, name: asset.name }))}
-          onSelectTool={setActiveTool}
-          onTerrainTypeChange={setTerrainType}
-          onAssetIdChange={setAssetId}
-          movementBudgetCells={movementBudgetCells}
-          onMovementBudgetCellsChange={setMovementBudgetCells}
-          onClearRuler={() => setClearRulerSignal((prev) => prev + 1)}
-          onAddAssetOption={handleAddAssetLibraryItem}
-          canEditMap={canEditMap}
-        />
-        <InitiativePanel snapshot={snapshot} onReorder={handleReorderInitiative} canEdit={canUseGMTools} />
-        <ActorPanel snapshot={snapshot} />
-        <CharacterImportPanel onImport={handleImport} canEdit={canUseGMTools} />
-        <DMToolsPanel
-          notes={notes}
-          templates={templates}
-          onSaveNotes={handleSaveNotes}
-          onAddTemplate={handleAddTemplate}
-          canEdit={canUseGMTools}
-        />
-        <JournalPanel
-          entries={journalEntries}
-          peers={session.peers}
-          canManage={canUseGMTools}
-          onCreate={handleCreateJournalEntry}
-          onUpdate={handleUpdateJournalEntry}
-          onShare={handleShareJournalEntry}
-        />
-        <HandoutPanel
-          handouts={handouts}
-          peers={session.peers}
-          canManage={canUseGMTools}
-          onCreate={handleCreateHandout}
-          onUpdate={handleUpdateHandout}
-          onShare={handleShareHandout}
-        />
-        <MacroPanel macros={macros} canManage={canUseGMTools} onCreate={handleCreateMacro} onRun={handleRunMacro} />
-        <RollTemplatePanel
-          rollTemplates={rollTemplates}
-          canManage={canUseGMTools}
-          onCreate={handleCreateRollTemplate}
-          onRender={handleRenderRollTemplate}
-        />
-        <PluginPanel
-          plugins={plugins}
-          canManage={canUseGMTools}
-          onRegister={handleRegisterPlugin}
-          onExecuteHook={handleExecutePluginHook}
-        />
-        <TutorialPanel tutorial={tutorial} />
-        <div className="panel side-panel">
-          <h3>Imported Characters</h3>
-          <ul className="list">
-            {characters.map((c) => (
-              <li key={`${c.name}-${c.level}`}>
-                {c.name} (Lvl {c.level} {c.character_class})
-              </li>
-            ))}
-          </ul>
-        </div>
-      </div>
-
-      {contextMenu && (
-        <div className="context-menu" style={{ left: contextMenu.x, top: contextMenu.y }}>
-          <button onClick={quickMeasureFromSelectedToContextToken}>Measure From Selected</button>
-          <button onClick={() => void applyTokenQuickAction("damage")}>Apply Damage</button>
-          <button onClick={() => void applyTokenQuickAction("heal")}>Heal</button>
-          <button onClick={() => void applyTokenQuickAction("condition")}>Add Condition</button>
-        </div>
-      )}
+    <div className="app-shell" data-theme="grimdark">
+      <AppShell
+        role={currentRole}
+        sessionIdHash={sessionIdHash}
+        selectionContextId={selectedLeadToken}
+        topBar={
+          <>
+            <span className="token-chip" id="topbar-session">Peer: {currentPeerId}</span>
+            <span className="token-chip">Role: {currentRole}</span>
+            <span className="token-chip" id="topbar-invite">Session: {session.session_id}</span>
+            {visibilityMaskActive && <span className="token-chip">Visibility mask active</span>}
+            <button
+              disabled={loadingSession || !session.campaign_id || !isActionAllowedForRole(rolePolicy, "openAdminSettings")}
+              onClick={() => {
+                if (!isActionAllowedForRole(rolePolicy, "openAdminSettings")) {
+                  emitUxEvent("role_policy_blocked_action", {
+                    role: currentRole,
+                    panelOrTabId: "openAdminSettings",
+                    viewportMode,
+                    sessionIdHash,
+                    timestamp: Date.now(),
+                  });
+                  return;
+                }
+                void handleHostInCampaign("Reuse Campaign Session", currentPeerId, session.campaign_id ?? "");
+              }}
+            >
+              Admin: Host Campaign Session
+            </button>
+          </>
+        }
+        leftRail={
+          <>
+            <div id="left-rail-tools">
+            <MapToolsPanel
+              activeTool={activeTool}
+              terrainType={terrainType}
+              assetId={assetId}
+              assetOptions={assetLibrary.map((asset) => ({ asset_id: asset.asset_id, name: asset.name }))}
+              onSelectTool={setActiveTool}
+              onTerrainTypeChange={setTerrainType}
+              onAssetIdChange={setAssetId}
+              movementBudgetCells={movementBudgetCells}
+              onMovementBudgetCellsChange={setMovementBudgetCells}
+              onClearRuler={() => setClearRulerSignal((prev) => prev + 1)}
+              onAddAssetOption={handleAddAssetLibraryItem}
+              canEditMap={canEditMap}
+              fogEnabled={snapshot.map.fog_enabled}
+              fogMode={fogMode}
+              previewPlayerView={previewPlayerView}
+              onFogModeChange={setFogMode}
+              onToggleFog={handleToggleFog}
+              onHideAllFog={() => void handleHideAllFog()}
+              onTogglePreviewPlayerView={() => setPreviewPlayerView((prev) => !prev)}
+              sceneLightingPreset={snapshot.map.scene_lighting_preset ?? "day"}
+              onSceneLightingPresetChange={(preset) => void handleSetSceneLightingPreset(preset)}
+              selectedTokenId={selectedLeadToken}
+              selectedTokenLight={selectedTokenLight}
+              onTokenLightChange={(nextLight) => void handleSetTokenLight(nextLight)}
+            />
+            </div>
+            <div className="panel side-panel">
+              <select value={selectedLeadToken} onChange={(e) => setSelectedTokens([e.target.value])}>
+                {tokenIds.map((tokenId) => (
+                  <option key={tokenId} value={tokenId}>
+                    {tokenId}
+                  </option>
+                ))}
+              </select>
+              <button onClick={handleNextTurn} disabled={!canUseGMTools}>Next Turn</button>
+              <button onClick={handleSave}>Save Session</button>
+              <button onClick={handleLoad}>Load Session</button>
+              {canUseGMTools && (
+                <>
+                  <input
+                    type="number"
+                    min={0}
+                    value={visionRadiusInput}
+                    onChange={(e) => setVisionRadiusInput(Number(e.target.value))}
+                    style={{ width: 72 }}
+                  />
+                  <button onClick={() => void handleSetTokenVisionRadius()}>Set Vision Radius</button>
+                </>
+              )}
+            </div>
+          </>
+        }
+        mapContent={
+          <>
+            <div id="map-canvas">
+            <MapCanvas
+              snapshot={snapshot}
+              selectedTokens={selectedTokens}
+              activeTool={activeTool}
+              terrainType={terrainType}
+              assetId={assetId}
+              onToggleToken={toggleTokenSelection}
+              onMoveTokens={handleMoveTokens}
+              onRevealCell={handleRevealCell}
+              onPaintTerrain={handlePaintTerrain}
+              onToggleBlocked={handleToggleBlocked}
+              onStampAsset={handleStampAsset}
+              onTokenContext={(target) => setContextMenu({ tokenId: target.tokenId, x: target.clientX, y: target.clientY })}
+              onTokenDoubleClick={(tokenId) => {
+                setSelectedTokens([tokenId]);
+                setStatus(`Opened details for ${tokenId}`);
+              }}
+              onTokenScreenPoint={(point) => setTokenHudAnchor((prev) => (prev?.tokenId === point.tokenId && prev.x === point.x && prev.y === point.y ? prev : point))}
+              canEditMap={canEditMap}
+              canMoveTokens={canMutateWithPolicy}
+              canControlToken={canControlToken}
+              useVisibilityMask={!canUseGMTools || previewPlayerView}
+              sceneLightingPreset={snapshot.map.scene_lighting_preset ?? "day"}
+              tokenLights={snapshot.map.token_light_by_token ?? {}}
+              tokenVisionModes={snapshot.map.vision_mode_by_token ?? {}}
+              movementBudgetCells={movementBudgetCells}
+              rulerPreset={rulerPreset}
+              clearRulerSignal={clearRulerSignal}
+              fogMode={fogMode}
+            />
+            </div>
+            {contextMenu && (
+              <div className="context-menu" style={{ left: contextMenu.x, top: contextMenu.y }}>
+                <button onClick={quickMeasureFromSelectedToContextToken}>Measure From Selected</button>
+                <button onClick={() => void applyTokenQuickAction("damage")}>Apply Damage</button>
+                <button onClick={() => void applyTokenQuickAction("heal")}>Heal</button>
+                <button onClick={() => void applyTokenQuickAction("condition")}>Add Condition</button>
+              </div>
+            )}
+            {tokenHudAnchor && (
+              <div id="token-hud" className={`token-hud ${canUseGMTools ? "token-hud-gm" : "token-hud-player"}`} style={{ left: tokenHudAnchor.x + 12, top: tokenHudAnchor.y - 16 }}>
+                <button onClick={() => void handleTokenHudAction("open-sheet")}>Sheet</button>
+                <button onClick={() => void handleTokenHudAction("damage")}>-HP</button>
+                <button onClick={() => void handleTokenHudAction("heal")}>+HP</button>
+                <button onClick={() => void handleTokenHudAction("condition")}>Cond</button>
+                <button onClick={() => void handleTokenHudAction("initiative")}>Init</button>
+                {canUseGMTools && <button onClick={() => void handleTokenHudAction("ping")}>Ping</button>}
+              </div>
+            )}
+          </>
+        }
+        rightSummary={<span>Selected: {selectedLeadToken}</span>}
+        rightSections={rightSections}
+        traySummary={
+          <>
+            <span id="tray-chat" className="token-chip">Chat unread: 0</span>
+            <span id="tray-combat" className="token-chip">Combat turn: {snapshot.combat.turn_index + 1}</span>
+            <span className="token-chip">Token: {selectedLeadToken}</span>
+          </>
+        }
+        trayTabs={trayTabs}
+        statusRail={<StatusRail role={currentRole} viewportMode={viewportMode} sessionIdHash={sessionIdHash} statuses={statusSignals} />}
+      />
+      <CommandPalette open={openCommandPalette} commands={commandItems} onClose={() => setOpenCommandPalette(false)} />
+      <ShortcutsOverlay open={openShortcuts} onClose={() => setOpenShortcuts(false)} />
+      <OnboardingOverlay
+        open={showOnboarding}
+        roleLabel={currentRole === "Player" ? "Player" : "Host"}
+        steps={onboardingSteps}
+        stepIndex={onboardingStepIndex}
+        canAdvance={onboardingCanAdvance}
+        completionHint={onboardingHint}
+        onBack={() => setOnboardingStepIndex((prev) => Math.max(0, prev - 1))}
+        onSkip={() => {
+          window.localStorage.setItem(getOnboardingStorageKey(currentPeerId, currentRole), "done");
+          setShowOnboarding(false);
+        }}
+        onNext={() => {
+          if (onboardingStepIndex >= onboardingSteps.length - 1) {
+            window.localStorage.setItem(getOnboardingStorageKey(currentPeerId, currentRole), "done");
+            setShowOnboarding(false);
+            return;
+          }
+          setOnboardingStepIndex((prev) => prev + 1);
+        }}
+        onReplay={() => {
+          setOnboardingStepIndex(0);
+          setShowOnboarding(true);
+        }}
+        canReplay={!showOnboarding}
+      />
     </div>
   );
 }
