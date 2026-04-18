@@ -38,6 +38,9 @@ class GameStateEngine:
     def reveal_cell(self, x: int, y: int) -> None:
         self.map_state.reveal_cell(x, y)
 
+    def hide_cell(self, x: int, y: int) -> None:
+        self.map_state.hide_cell(x, y)
+
     def paint_terrain(self, x: int, y: int, terrain_type: str) -> None:
         self.map_state.paint_terrain(x, y, terrain_type)
 

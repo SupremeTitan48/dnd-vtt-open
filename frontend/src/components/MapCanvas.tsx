@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useState } from "react";
 import type { Snapshot } from "../types";
-import type { MapTool } from "./MapToolsPanel";
+import type { FogMode, MapTool } from "./MapToolsPanel";
 
 type ContextTarget = { tokenId: string; clientX: number; clientY: number };
+type TokenScreenPoint = { tokenId: string; x: number; y: number };
 
 type Props = {
   snapshot: Snapshot;
@@ -17,6 +18,8 @@ type Props = {
   onToggleBlocked: (x: number, y: number) => void;
   onStampAsset: (x: number, y: number, assetId: string) => void;
   onTokenContext: (target: ContextTarget) => void;
+  onTokenDoubleClick?: (tokenId: string) => void;
+  onTokenScreenPoint?: (point: TokenScreenPoint) => void;
   canEditMap: boolean;
   canMoveTokens: boolean;
   canControlToken: (tokenId: string) => boolean;
@@ -24,13 +27,14 @@ type Props = {
   movementBudgetCells: number;
   rulerPreset: { start: { x: number; y: number }; end: { x: number; y: number }; nonce: number } | null;
   clearRulerSignal: number;
+  fogMode: FogMode;
 };
 
 const TERRAIN_COLORS: Record<string, string> = {
-  grass: "#2a5f36",
-  stone: "#575d6e",
-  water: "#2a4f78",
-  lava: "#7f3028",
+  grass: "var(--map-terrain-grass)",
+  stone: "var(--map-terrain-stone)",
+  water: "var(--map-terrain-water)",
+  lava: "var(--map-terrain-lava)",
 };
 
 const ASSET_LABELS: Record<string, string> = {
@@ -53,6 +57,8 @@ export function MapCanvas({
   onToggleBlocked,
   onStampAsset,
   onTokenContext,
+  onTokenDoubleClick,
+  onTokenScreenPoint,
   canEditMap,
   canMoveTokens,
   canControlToken,
@@ -60,6 +66,7 @@ export function MapCanvas({
   movementBudgetCells,
   rulerPreset,
   clearRulerSignal,
+  fogMode,
 }: Props) {
   const size = 26;
   const width = snapshot.map.width * size;
@@ -103,7 +110,7 @@ export function MapCanvas({
   function applyCellTool(x: number, y: number) {
     if (!canEditMap) return;
     if (activeTool === "reveal") {
-      onRevealCell(x, y);
+      if (fogMode === "reveal") onRevealCell(x, y);
       return;
     }
     if (activeTool === "terrain") {
@@ -143,7 +150,7 @@ export function MapCanvas({
       <svg
         width={width}
         height={height}
-        style={{ background: "#191c2a", borderRadius: 10 }}
+        style={{ background: "var(--map-bg)", borderRadius: 10 }}
         onClick={(e) => {
           const rect = (e.currentTarget as SVGSVGElement).getBoundingClientRect();
           const { x, y } = cellFromPointer(e.clientX, e.clientY, rect);
@@ -184,14 +191,14 @@ export function MapCanvas({
         {Object.entries(snapshot.map.terrain_tiles).map(([key, terrain]) => {
           const [x, y] = key.split(":").map(Number);
           if (!isCellVisible(x, y)) return null;
-          return <rect key={`terrain-${key}`} x={x * size} y={y * size} width={size} height={size} fill={TERRAIN_COLORS[terrain] ?? "#2a5f36"} opacity={0.85} />;
+          return <rect key={`terrain-${key}`} x={x * size} y={y * size} width={size} height={size} fill={TERRAIN_COLORS[terrain] ?? "var(--map-terrain-grass)"} opacity={0.85} />;
         })}
 
         {Array.from({ length: snapshot.map.width + 1 }, (_, x) => (
-          <line key={`vx-${x}`} x1={x * size} y1={0} x2={x * size} y2={height} stroke="#323754" strokeWidth={1} />
+          <line key={`vx-${x}`} x1={x * size} y1={0} x2={x * size} y2={height} stroke="var(--map-grid)" strokeWidth={1} />
         ))}
         {Array.from({ length: snapshot.map.height + 1 }, (_, y) => (
-          <line key={`hy-${y}`} x1={0} y1={y * size} x2={width} y2={y * size} stroke="#323754" strokeWidth={1} />
+          <line key={`hy-${y}`} x1={0} y1={y * size} x2={width} y2={y * size} stroke="var(--map-grid)" strokeWidth={1} />
         ))}
 
         {snapshot.map.fog_enabled &&
@@ -200,7 +207,7 @@ export function MapCanvas({
               const cellKey = `${x}:${y}`;
               const isRevealed = visibilityMask ? visibilityMask.has(cellKey) : revealed.has(cellKey);
               return isRevealed ? null : (
-                <rect key={`fog-${x}-${y}`} x={x * size} y={y * size} width={size} height={size} fill="rgba(6, 7, 12, 0.78)" />
+                <rect key={`fog-${x}-${y}`} x={x * size} y={y * size} width={size} height={size} fill="var(--map-fog)" />
               );
             }),
           )}
@@ -210,9 +217,9 @@ export function MapCanvas({
           if (!isCellVisible(x, y)) return null;
           return (
             <g key={`blocked-${key}`}>
-              <rect x={x * size + 2} y={y * size + 2} width={size - 4} height={size - 4} fill="rgba(90,20,20,0.45)" />
-              <line x1={x * size + 4} y1={y * size + 4} x2={(x + 1) * size - 4} y2={(y + 1) * size - 4} stroke="#ff8a8a" strokeWidth={2} />
-              <line x1={(x + 1) * size - 4} y1={y * size + 4} x2={x * size + 4} y2={(y + 1) * size - 4} stroke="#ff8a8a" strokeWidth={2} />
+              <rect x={x * size + 2} y={y * size + 2} width={size - 4} height={size - 4} fill="var(--map-blocked-fill)" />
+              <line x1={x * size + 4} y1={y * size + 4} x2={(x + 1) * size - 4} y2={(y + 1) * size - 4} stroke="var(--map-blocked-stroke)" strokeWidth={2} />
+              <line x1={(x + 1) * size - 4} y1={y * size + 4} x2={x * size + 4} y2={(y + 1) * size - 4} stroke="var(--map-blocked-stroke)" strokeWidth={2} />
             </g>
           );
         })}
@@ -221,7 +228,7 @@ export function MapCanvas({
           const [x, y] = key.split(":").map(Number);
           if (!isCellVisible(x, y)) return null;
           return (
-            <text key={`asset-${key}`} x={x * size + size / 2} y={y * size + size / 2 + 5} textAnchor="middle" fill="#f6e5b7" fontWeight={700} fontSize={14}>
+            <text key={`asset-${key}`} x={x * size + size / 2} y={y * size + size / 2 + 5} textAnchor="middle" fill="var(--map-asset-text)" fontWeight={700} fontSize={14}>
               {ASSET_LABELS[asset] ?? "*"}
             </text>
           );
@@ -246,17 +253,32 @@ export function MapCanvas({
                 if (!canMoveTokens || !canControlToken(tokenId)) return;
                 onTokenContext({ tokenId, clientX: e.clientX, clientY: e.clientY });
               }}
+              onDoubleClick={() => onTokenDoubleClick?.(tokenId)}
             >
-              <circle cx={x * size + size / 2} cy={y * size + size / 2} r={selected ? 10 : 9} fill={selected ? "#78c6ff" : "#89e889"} stroke="#101218" strokeWidth={2} />
-              <text x={x * size + size / 2} y={y * size + size / 2 + 4} textAnchor="middle" fill="#101218" fontWeight={700} fontSize={12}>
+              <circle cx={x * size + size / 2} cy={y * size + size / 2} r={selected ? 10 : 9} fill={selected ? "var(--map-token-selected)" : "var(--map-token-default)"} stroke="var(--map-token-stroke)" strokeWidth={2} />
+              <text x={x * size + size / 2} y={y * size + size / 2 + 4} textAnchor="middle" fill="var(--map-token-stroke)" fontWeight={700} fontSize={12}>
                 {tokenId.slice(0, 1).toUpperCase()}
               </text>
+              {selected && onTokenScreenPoint && (
+                <rect
+                  x={x * size + size / 2 - 1}
+                  y={y * size + size / 2 - 1}
+                  width={2}
+                  height={2}
+                  fill="transparent"
+                  ref={(node) => {
+                    if (!node) return;
+                    const box = node.getBoundingClientRect();
+                    onTokenScreenPoint({ tokenId, x: box.left + box.width / 2, y: box.top + box.height / 2 });
+                  }}
+                />
+              )}
             </g>
           );
         })}
 
         {dragGhost && activeTool === "move" && (
-          <circle cx={dragGhost.x * size + size / 2} cy={dragGhost.y * size + size / 2} r={11} fill="rgba(120, 198, 255, 0.35)" stroke="#9ed7ff" strokeDasharray="4 3" />
+          <circle cx={dragGhost.x * size + size / 2} cy={dragGhost.y * size + size / 2} r={11} fill="var(--map-ruler-ghost)" stroke="var(--map-ruler-ghost-stroke)" strokeDasharray="4 3" />
         )}
 
         {rulerStart && rulerEnd && (
@@ -266,17 +288,18 @@ export function MapCanvas({
               y1={rulerStart.y * size + size / 2}
               x2={rulerEnd.x * size + size / 2}
               y2={rulerEnd.y * size + size / 2}
-              stroke="#f5d66d"
+              stroke="var(--map-ruler)"
               strokeWidth={2}
               strokeDasharray="6 4"
             />
-            <circle cx={rulerStart.x * size + size / 2} cy={rulerStart.y * size + size / 2} r={4} fill="#f5d66d" />
-            <circle cx={rulerEnd.x * size + size / 2} cy={rulerEnd.y * size + size / 2} r={4} fill="#f5d66d" />
+            <circle cx={rulerStart.x * size + size / 2} cy={rulerStart.y * size + size / 2} r={4} fill="var(--map-ruler)" />
+            <circle cx={rulerEnd.x * size + size / 2} cy={rulerEnd.y * size + size / 2} r={4} fill="var(--map-ruler)" />
           </g>
         )}
       </svg>
-      <div style={{ marginTop: 8, fontSize: 12, color: "#aab3dd" }}>
+      <div style={{ marginTop: 8, fontSize: 12, color: "var(--map-annotation)" }}>
         Active tool: {activeTool}. Shift/Cmd-click multi-select tokens. Right-click token for quick actions.
+        {activeTool === "reveal" ? ` Fog mode: ${fogMode}.` : ""}
         {visibilityMaskActive ? " Visibility mask: active." : ""}
         {rulerDistanceCells !== null
           ? ` Ruler: ${rulerDistanceCells} cells (${rulerDistanceFeet} ft) - ${withinBudget ? "within" : "over"} budget (${movementBudgetCells}).`

@@ -84,6 +84,12 @@ class RevealCellRequest(BaseModel):
     command: Optional[CommandContextRequest] = None
 
 
+class HideCellRequest(BaseModel):
+    x: int = Field(ge=0)
+    y: int = Field(ge=0)
+    command: Optional[CommandContextRequest] = None
+
+
 class PaintTerrainRequest(BaseModel):
     x: int = Field(ge=0)
     y: int = Field(ge=0)
@@ -232,11 +238,22 @@ class PruneBackupsRequest(BaseModel):
     command: Optional[CommandContextRequest] = None
 
 
+class PruneBackupsByAgeRequest(BaseModel):
+    max_age_days: int = Field(ge=0, le=3650)
+    command: Optional[CommandContextRequest] = None
+
+
 class ImportBackupRequest(BaseModel):
     backup: Dict[str, Any]
     checksum_sha256: str = Field(min_length=64, max_length=64)
+    signature_hmac_sha256: Optional[str] = Field(default=None, min_length=64, max_length=64)
     command: Optional[CommandContextRequest] = None
 
 
 class BackupRequest(BaseModel):
+    command: Optional[CommandContextRequest] = None
+
+
+class MigrateSessionRequest(BaseModel):
+    dry_run: bool = False
     command: Optional[CommandContextRequest] = None

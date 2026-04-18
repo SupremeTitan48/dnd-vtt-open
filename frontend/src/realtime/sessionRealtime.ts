@@ -1,4 +1,5 @@
 import { getEventReplayWithContext, getState, listCharacters, type ReadContext } from "../lib/apiClient";
+import { getDesktopConfigSync } from "../lib/desktopBridge";
 import type { CharacterSheet, Snapshot } from "../types";
 
 type RealtimeHandlers = {
@@ -18,17 +19,25 @@ export function connectSessionEvents(
   const bufferedByRevision = new Map<number, true>();
   let refreshTimer: ReturnType<typeof setTimeout> | null = null;
   let redactionNoticeShown = false;
-  const readContext = getReadContext();
-  const wsParams = new URLSearchParams();
-  if (readContext.actor_peer_id) wsParams.set("actor_peer_id", readContext.actor_peer_id);
-  if (readContext.actor_token) wsParams.set("actor_token", readContext.actor_token);
-  if (readContext.actor_role) wsParams.set("actor_role", readContext.actor_role);
-  const protocol = window.location.protocol === "https:" ? "wss" : "ws";
-  const apiHost = import.meta.env.VITE_API_WS_HOST ?? `${window.location.hostname}:8000`;
-  const wsUrl = `${protocol}://${apiHost}/api/sessions/${sessionId}/events?${wsParams.toString()}`;
+  function buildWsUrl(): { url: string; hasAuthContext: boolean } {
+    const readContext = getReadContext();
+    const wsParams = new URLSearchParams();
+    if (readContext.actor_peer_id) wsParams.set("actor_peer_id", readContext.actor_peer_id);
+    if (readContext.actor_token) wsParams.set("actor_token", readContext.actor_token);
+    if (readContext.actor_role) wsParams.set("actor_role", readContext.actor_role);
+    const protocol = window.location.protocol === "https:" ? "wss" : "ws";
+    const apiHost = getDesktopConfigSync()?.wsHost ?? import.meta.env.VITE_API_WS_HOST ?? `${window.location.hostname}:8000`;
+    const query = wsParams.toString();
+    return {
+      url: `${protocol}://${apiHost}/api/sessions/${sessionId}/events${query ? `?${query}` : ""}`,
+      hasAuthContext: Boolean(readContext.actor_peer_id && readContext.actor_token),
+    };
+  }
+
   let ws: WebSocket | null = null;
   let reconnectAttempts = 0;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  let activeConnectionNonce = 0;
 
   async function refreshSnapshotAndCharacters() {
     const context = getReadContext();
@@ -84,8 +93,11 @@ export function connectSessionEvents(
   }
 
   function connect() {
-    ws = new WebSocket(wsUrl);
+    const connectionNonce = ++activeConnectionNonce;
+    const { url, hasAuthContext } = buildWsUrl();
+    ws = new WebSocket(url);
     ws.onopen = () => {
+      if (isClosed || connectionNonce !== activeConnectionNonce) return;
       reconnectAttempts = 0;
       ws?.send("subscribed");
       handlers.onStatus?.("Realtime connected");
@@ -96,6 +108,7 @@ export function connectSessionEvents(
     };
 
     ws.onmessage = async (message) => {
+      if (isClosed || connectionNonce !== activeConnectionNonce) return;
       const event = JSON.parse(message.data) as { revision?: number; event_type?: string; payload?: Record<string, unknown> };
       lastAppliedRevision = Math.max(lastAppliedRevision, getCurrentRevision());
 
@@ -130,10 +143,22 @@ export function connectSessionEvents(
       }
     };
 
-    ws.onerror = () => handlers.onStatus?.("Realtime connection error");
-    ws.onclose = () => {
+    ws.onerror = () => {
+      if (isClosed || connectionNonce !== activeConnectionNonce) return;
+      handlers.onStatus?.("Realtime connection error");
+    };
+    ws.onclose = (event) => {
+      if (connectionNonce !== activeConnectionNonce) return;
       if (isClosed) return;
-      reconnectAttempts += 1;
+      if (!hasAuthContext) {
+        handlers.onStatus?.("Realtime waiting for valid session token...");
+      }
+      if (event.code === 1008) {
+        // Authentication/authorization close: back off harder to reduce noisy reconnect churn.
+        reconnectAttempts = Math.max(reconnectAttempts, 3);
+      } else {
+        reconnectAttempts += 1;
+      }
       const waitMs = Math.min(5000, 250 * 2 ** reconnectAttempts);
       handlers.onStatus?.(`Realtime reconnecting in ${Math.max(1, Math.round(waitMs / 1000))}s`);
       reconnectTimer = setTimeout(() => {
@@ -146,6 +171,7 @@ export function connectSessionEvents(
 
   return () => {
     isClosed = true;
+    activeConnectionNonce += 1;
     if (refreshTimer) {
       clearTimeout(refreshTimer);
       refreshTimer = null;
