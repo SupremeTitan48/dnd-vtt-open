@@ -95,7 +95,7 @@ export function OnboardingOverlay({
                 Back
               </button>
               <button onClick={onSkip}>Skip</button>
-              <button onClick={onNext} disabled={!canAdvance}>
+              <button onClick={onNext} disabled={!canAdvance && stepIndex < steps.length - 1}>
                 {stepIndex === steps.length - 1 ? "Finish" : "Next"}
               </button>
             </div>
